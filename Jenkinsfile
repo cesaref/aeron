@@ -1,7 +1,9 @@
 node {
-    stage 'Checkout'
+    stage('Checkout') {
         checkout scm
+    }
 
-    stage 'Build'
-        cppbuild/cppbuild.sh
+    stage('Build Cpp') {
+        sh 'cppbuild/cppbuild'
+    }
 }
