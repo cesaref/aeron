@@ -4,7 +4,7 @@ node {
     }
 
     stage('Build Java') {
-        sh 'gradlew'
+        sh './gradlew'
     }
 
     stage('Build Cpp') {
