@@ -1,13 +1,27 @@
-node {
-    stage('Checkout') {
-        checkout scm
-    }
+// Define the lables that we want to run the build on in parallel
+// Setup jenkins nodes with these lables defined
+def labels = ['linux', 'osx']
 
-    stage('Build Java') {
-        sh './gradlew'
-    }
+def builders = [:]
 
-    stage('Build Cpp') {
-        sh 'cppbuild/cppbuild'
+for (x in labels) {
+    def label = x
+
+    builders[label] =  {
+
+        node(label) {
+            stage('Checkout') {
+            checkout scm
+        }
+
+        stage('Build Java') {
+            sh './gradlew'
+        }
+
+        stage('Build Cpp') {
+            sh 'cppbuild/cppbuild'
+        }
     }
 }
+
+parallel builders
