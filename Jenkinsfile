@@ -11,15 +11,16 @@ for (x in labels) {
 
         node(label) {
             stage('Checkout') {
-            checkout scm
-        }
+                checkout scm
+            }
 
-        stage('Build Java') {
-            sh './gradlew'
-        }
+            stage('Build Java') {
+                sh './gradlew'
+            }
 
-        stage('Build Cpp') {
-            sh 'cppbuild/cppbuild'
+            stage('Build Cpp') {
+                sh 'cppbuild/cppbuild'
+            }
         }
     }
 }
