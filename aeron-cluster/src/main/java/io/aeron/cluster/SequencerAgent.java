@@ -28,9 +28,17 @@ import java.util.ArrayList;
 import java.util.Iterator;
 
 import static io.aeron.cluster.ClusterSession.State.*;
+import static io.aeron.cluster.control.ClusterControl.Action.NEUTRAL;
+import static io.aeron.cluster.control.ClusterControl.Action.RESUME;
+import static io.aeron.cluster.control.ClusterControl.Action.SUSPEND;
 
 class SequencerAgent implements Agent
 {
+    enum State
+    {
+        INIT, ACTIVE, SUSPENDED
+    }
+
     /**
      * Message detail to be sent when max concurrent session limit is reached.
      */
@@ -47,38 +55,43 @@ class SequencerAgent implements Agent
     private final EpochClock epochClock;
     private final CachedEpochClock cachedEpochClock;
     private final TimerService timerService;
+    private final ConsensusModuleAdapter consensusModuleAdapter;
     private final IngressAdapter ingressAdapter;
     private final EgressPublisher egressPublisher;
     private final LogAppender logAppender;
     private final Counter messageIndex;
+    private final Counter controlToggle;
     private final ClusterSessionSupplier clusterSessionSupplier;
     private final Long2ObjectHashMap<ClusterSession> sessionByIdMap = new Long2ObjectHashMap<>();
     private final ArrayList<ClusterSession> pendingSessions = new ArrayList<>();
     private final ArrayList<ClusterSession> rejectedSessions = new ArrayList<>();
     private final ConsensusModule.Context ctx;
+    private State state = State.INIT;
 
     // TODO: last message correlation id per session counter
 
     SequencerAgent(
         final ConsensusModule.Context ctx,
         final EgressPublisher egressPublisher,
-        final Counter messageIndex,
         final LogAppender logAppender,
         final IngressAdapterSupplier ingressAdapterSupplier,
         final TimerServiceSupplier timerServiceSupplier,
-        final ClusterSessionSupplier clusterSessionSupplier)
+        final ClusterSessionSupplier clusterSessionSupplier,
+        final ConsensusModuleAdapterSupplier consensusModuleAdapterSupplier)
     {
         this.ctx = ctx;
         this.epochClock = ctx.epochClock();
         this.cachedEpochClock = ctx.cachedEpochClock();
         this.sessionTimeoutMs = ctx.sessionTimeoutNs() / 1000;
         this.egressPublisher = egressPublisher;
-        this.messageIndex = messageIndex;
+        this.messageIndex = ctx.messageIndex();
+        this.controlToggle = ctx.controlToggle();
         this.logAppender = logAppender;
         this.clusterSessionSupplier = clusterSessionSupplier;
 
         ingressAdapter = ingressAdapterSupplier.newIngressAdapter(this);
         timerService = timerServiceSupplier.newTimerService(this);
+        consensusModuleAdapter = consensusModuleAdapterSupplier.newConsensusModuleAdapter(this);
         aeronClientInvoker = ctx.ownsAeronClient() ? ctx.aeron().conductorAgentInvoker() : null;
     }
 
@@ -92,7 +105,7 @@ class SequencerAgent implements Agent
             }
 
             CloseHelper.close(ingressAdapter);
-            CloseHelper.close(timerService);
+            CloseHelper.close(consensusModuleAdapter);
         }
     }
 
@@ -108,10 +121,16 @@ class SequencerAgent implements Agent
             workCount += aeronClientInvoker.invoke();
         }
 
-        workCount += processPendingSessions(pendingSessions, nowMs);
-        workCount += ingressAdapter.poll();
-        workCount += timerService.poll(nowMs);
-        workCount += checkSessions(sessionByIdMap, nowMs);
+        workCount += checkControlToggle();
+        workCount += consensusModuleAdapter.poll();
+
+        if (State.ACTIVE == state)
+        {
+            workCount += processPendingSessions(pendingSessions, nowMs);
+            workCount += timerService.poll(nowMs);
+            workCount += ingressAdapter.poll();
+            workCount += checkSessions(sessionByIdMap, nowMs);
+        }
 
         processRejectedSessions(rejectedSessions, nowMs);
 
@@ -121,6 +140,11 @@ class SequencerAgent implements Agent
     public String roleName()
     {
         return "sequencer";
+    }
+
+    public void onServiceReady(final long serviceId)
+    {
+        state = State.ACTIVE;
     }
 
     public void onSessionConnect(final long correlationId, final int responseStreamId, final String responseChannel)
@@ -197,6 +221,42 @@ class SequencerAgent implements Agent
         }
 
         return false;
+    }
+
+    public void onScheduleTimer(final long correlationId, final long deadlineMs)
+    {
+        timerService.scheduleTimer(correlationId, deadlineMs);
+    }
+
+    public void onCancelTimer(final long correlationId)
+    {
+        timerService.cancelTimer(correlationId);
+    }
+
+    State state()
+    {
+        return state;
+    }
+
+    private int checkControlToggle()
+    {
+        final long toggleValue = controlToggle.get();
+
+        if (SUSPEND.code() == toggleValue)
+        {
+            state = State.SUSPENDED;
+            NEUTRAL.toggle(controlToggle);
+            return 1;
+        }
+
+        if (RESUME.code() == toggleValue)
+        {
+            state = State.ACTIVE;
+            NEUTRAL.toggle(controlToggle);
+            return 1;
+        }
+
+        return 0;
     }
 
     private int processPendingSessions(final ArrayList<ClusterSession> pendingSessions, final long nowMs)

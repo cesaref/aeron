@@ -81,11 +81,13 @@ class CountersReader
 {
 public:
     inline CountersReader(const AtomicBuffer& metadataBuffer, const AtomicBuffer& valuesBuffer) :
-        m_metadataBuffer(metadataBuffer), m_valuesBuffer(valuesBuffer)
+        m_metadataBuffer(metadataBuffer),
+        m_valuesBuffer(valuesBuffer),
+        m_maxCounterId(valuesBuffer.capacity() / COUNTER_LENGTH)
     {
     }
 
-    void forEach(const on_counters_metadata_t& onCountersMetadata)
+    void forEach(const on_counters_metadata_t& onCountersMetadata) const
     {
         std::int32_t id = 0;
 
@@ -101,7 +103,7 @@ public:
             {
                 const struct CounterMetaDataDefn& record = m_metadataBuffer.overlayStruct<CounterMetaDataDefn>(i);
 
-                const std::string label = m_metadataBuffer.getStringUtf8(i + LABEL_LENGTH_OFFSET);
+                const std::string label = m_metadataBuffer.getString(i + LABEL_LENGTH_OFFSET);
                 const AtomicBuffer keyBuffer(m_metadataBuffer.buffer() + i + KEY_OFFSET, sizeof(CounterMetaDataDefn::key));
 
                 onCountersMetadata(id, record.typeId, keyBuffer, label);
@@ -111,9 +113,30 @@ public:
         }
     }
 
-    inline std::int64_t getCounterValue(std::int32_t id)
+    inline std::int32_t maxCounterId() const
     {
-        return m_valuesBuffer.getInt64Volatile(id * COUNTER_LENGTH);
+        return m_maxCounterId;
+    }
+
+    inline std::int64_t getCounterValue(std::int32_t id) const
+    {
+        validateCounterId(id);
+
+        return m_valuesBuffer.getInt64Volatile(counterOffset(id));
+    }
+
+    inline std::int32_t getCounterState(std::int32_t id) const
+    {
+        validateCounterId(id);
+
+        return m_metadataBuffer.getInt32Volatile(metadataOffset(id));
+    }
+
+    inline std::string getCounterLabel(std::int32_t id) const
+    {
+        validateCounterId(id);
+
+        return m_metadataBuffer.getString(metadataOffset(id) + LABEL_LENGTH_OFFSET);
     }
 
     inline static util::index_t counterOffset(std::int32_t counterId)
@@ -126,9 +149,14 @@ public:
         return counterId * METADATA_LENGTH;
     }
 
-    inline AtomicBuffer valuesBuffer()
+    inline AtomicBuffer valuesBuffer() const
     {
         return m_valuesBuffer;
+    }
+
+    inline AtomicBuffer metaDataBuffer() const
+    {
+        return m_metadataBuffer;
     }
 
 #pragma pack(push)
@@ -152,6 +180,7 @@ public:
     static const std::int32_t RECORD_UNUSED = 0;
     static const std::int32_t RECORD_ALLOCATED = 1;
     static const std::int32_t RECORD_RECLAIMED = -1;
+    static const std::int32_t RECORD_LINGERING = -2;
 
     static const util::index_t COUNTER_LENGTH = sizeof(CounterValueDefn);
     static const util::index_t METADATA_LENGTH = sizeof(CounterMetaDataDefn);
@@ -164,6 +193,17 @@ public:
 protected:
     AtomicBuffer m_metadataBuffer;
     AtomicBuffer m_valuesBuffer;
+    const std::int32_t m_maxCounterId;
+
+    void validateCounterId(std::int32_t counterId) const
+    {
+        if (counterId < 0 || counterId > m_maxCounterId)
+        {
+            throw util::IllegalArgumentException(
+                util::strPrintf("Counter Id %d out of range: maxCounterId=%d", counterId, m_maxCounterId),
+                SOURCEINFO);
+        }
+    }
 };
 
 }}

@@ -34,14 +34,15 @@ import org.agrona.ExpandableArrayBuffer;
 import org.agrona.collections.MutableInteger;
 import org.agrona.concurrent.NoOpLock;
 import org.agrona.concurrent.status.AtomicCounter;
-import org.junit.*;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
 
 import static org.hamcrest.core.Is.is;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
 
-@Ignore
 public class ClusterNodeTest
 {
     private static final int FRAGMENT_LIMIT = 1;
@@ -67,6 +68,7 @@ public class ClusterNodeTest
     @After
     public void after()
     {
+        CloseHelper.close(container);
         CloseHelper.close(clusteredMediaDriver);
 
         clusteredMediaDriver.archive().context().deleteArchiveDirectory();
@@ -81,6 +83,8 @@ public class ClusterNodeTest
     @Test
     public void shouldConnectAndSendKeepAlive()
     {
+        container = launchEchoService();
+
         try (AeronCluster aeronCluster = connectToCluster())
         {
             assertTrue(aeronCluster.sendKeepAlive());
@@ -139,7 +143,6 @@ public class ClusterNodeTest
         }
 
         aeronCluster.close();
-        container.close();
     }
 
     @Test(timeout = 10_000)
@@ -193,7 +196,6 @@ public class ClusterNodeTest
         }
 
         aeronCluster.close();
-        container.close();
     }
 
     private ClusteredServiceContainer launchEchoService()

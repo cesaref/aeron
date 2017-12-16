@@ -94,6 +94,16 @@ public final class ClusteredServiceContainer implements AutoCloseable
     public static class Configuration
     {
         /**
+         * Identity for a clustered service.
+         */
+        public static final String SERVICE_ID_PROP_NAME = "aeron.cluster.service.id";
+
+        /**
+         * Identity for a clustered service. Default to 0.
+         */
+        public static final long SERVICE_ID_DEFAULT = 0;
+
+        /**
          * Channel for the clustered log.
          */
         public static final String LOG_CHANNEL_PROP_NAME = "aeron.cluster.log.channel";
@@ -134,24 +144,24 @@ public final class ClusteredServiceContainer implements AutoCloseable
         public static final int LOG_REPLAY_STREAM_ID_DEFAULT = 4;
 
         /**
-         * Channel for timer scheduling messages to the cluster.
+         * Channel for sending messages to the Consensus Module.
          */
-        public static final String TIMER_CHANNEL_PROP_NAME = "aeron.cluster.timer.channel";
+        public static final String CONSENSUS_MODULE_CHANNEL_PROP_NAME = "aeron.consensus.module.channel";
 
         /**
-         * Channel for timer scheduling messages to the cluster. This should be IPC.
+         * Channel for for sending messages to the Consensus Module. This should be IPC.
          */
-        public static final String TIMER_CHANNEL_DEFAULT = CommonContext.IPC_CHANNEL;
+        public static final String CONSENSUS_MODULE_CHANNEL_DEFAULT = CommonContext.IPC_CHANNEL;
 
         /**
-         * Stream id within a channel for timer scheduling messages to the cluster.
+         * Stream id within a channel for sending messages to the Consensus Module.
          */
-        public static final String TIMER_STREAM_ID_PROP_NAME = "aeron.cluster.timer.stream.id";
+        public static final String CONSENSUS_MODULE_STREAM_ID_PROP_NAME = "aeron.consensus.module.stream.id";
 
         /**
-         * Stream id within a channel for timer scheduling messages to the cluster. Default to stream id of 4.
+         * Stream id within a channel for sending messages to the Consensus Module. Default to stream id of 5.
          */
-        public static final int TIMER_STREAM_ID_DEFAULT = 4;
+        public static final int CONSENSUS_MODULE_STREAM_ID_DEFAULT = 5;
 
         /**
          * Whether to start without any previous log or use any existing log.
@@ -163,11 +173,30 @@ public final class ClusteredServiceContainer implements AutoCloseable
          */
         public static final String DIR_DELETE_ON_START_DEFAULT = "false";
 
+        /**
+         * Directory to use for the cluster container.
+         */
         public static final String CLUSTER_DIR_PROP_NAME = "aeron.cluster.dir";
 
+        /**
+         * Directory to use for the cluster container.
+         */
         public static final String CLUSTER_DIR_DEFAULT = "cluster";
 
-        public static final String RECORDING_IDS_LOG_FILE_NAME = "recording-events.log";
+        /**
+         * Filename for the recording events log
+         */
+        public static final String RECORDING_EVENTS_LOG_FILE_NAME = "recording-events.log";
+
+        /**
+         * The value {@link #SERVICE_ID_DEFAULT} or system property {@link #SERVICE_ID_PROP_NAME} if set.
+         *
+         * @return {@link #SERVICE_ID_DEFAULT} or system property {@link #SERVICE_ID_PROP_NAME} if set.
+         */
+        public static long serviceId()
+        {
+            return Long.getLong(SERVICE_ID_PROP_NAME, SERVICE_ID_DEFAULT);
+        }
 
         /**
          * The value {@link #LOG_CHANNEL_DEFAULT} or system property {@link #LOG_CHANNEL_PROP_NAME} if set.
@@ -212,23 +241,27 @@ public final class ClusteredServiceContainer implements AutoCloseable
         }
 
         /**
-         * The value {@link #TIMER_CHANNEL_DEFAULT} or system property {@link #TIMER_CHANNEL_PROP_NAME} if set.
+         * The value {@link #CONSENSUS_MODULE_CHANNEL_DEFAULT} or system property
+         * {@link #CONSENSUS_MODULE_CHANNEL_PROP_NAME} if set.
          *
-         * @return {@link #TIMER_CHANNEL_DEFAULT} or system property {@link #TIMER_CHANNEL_PROP_NAME} if set.
+         * @return {@link #CONSENSUS_MODULE_CHANNEL_DEFAULT} or system property
+         * {@link #CONSENSUS_MODULE_CHANNEL_PROP_NAME} if set.
          */
-        public static String timerChannel()
+        public static String consensusModuleChannel()
         {
-            return System.getProperty(TIMER_CHANNEL_PROP_NAME, TIMER_CHANNEL_DEFAULT);
+            return System.getProperty(CONSENSUS_MODULE_CHANNEL_PROP_NAME, CONSENSUS_MODULE_CHANNEL_DEFAULT);
         }
 
         /**
-         * The value {@link #TIMER_STREAM_ID_DEFAULT} or system property {@link #TIMER_STREAM_ID_PROP_NAME} if set.
+         * The value {@link #CONSENSUS_MODULE_STREAM_ID_DEFAULT} or system property
+         * {@link #CONSENSUS_MODULE_STREAM_ID_PROP_NAME} if set.
          *
-         * @return {@link #TIMER_STREAM_ID_DEFAULT} or system property {@link #TIMER_STREAM_ID_PROP_NAME} if set.
+         * @return {@link #CONSENSUS_MODULE_STREAM_ID_DEFAULT} or system property
+         * {@link #CONSENSUS_MODULE_STREAM_ID_PROP_NAME} if set.
          */
-        public static int timerStreamId()
+        public static int consensusModuleStreamId()
         {
-            return Integer.getInteger(TIMER_STREAM_ID_PROP_NAME, TIMER_STREAM_ID_DEFAULT);
+            return Integer.getInteger(CONSENSUS_MODULE_STREAM_ID_PROP_NAME, CONSENSUS_MODULE_STREAM_ID_DEFAULT);
         }
 
         public static final String DEFAULT_IDLE_STRATEGY = "org.agrona.concurrent.BackoffIdleStrategy";
@@ -259,6 +292,11 @@ public final class ClusteredServiceContainer implements AutoCloseable
             return "true".equalsIgnoreCase(getProperty(DIR_DELETE_ON_START_PROP_NAME, DIR_DELETE_ON_START_DEFAULT));
         }
 
+        /**
+         * The value {@link #CLUSTER_DIR_DEFAULT} or system property {@link #CLUSTER_DIR_PROP_NAME} if set.
+         *
+         * @return {@link #CLUSTER_DIR_DEFAULT} or system property {@link #CLUSTER_DIR_PROP_NAME} if set.
+         */
         public static String clusterDirName()
         {
             return System.getProperty(CLUSTER_DIR_PROP_NAME, CLUSTER_DIR_DEFAULT);
@@ -267,12 +305,13 @@ public final class ClusteredServiceContainer implements AutoCloseable
 
     public static class Context implements AutoCloseable
     {
+        private long serviceId = Configuration.serviceId();
         private String logChannel = Configuration.logChannel();
         private int logStreamId = Configuration.logStreamId();
         private String logReplayChannel = Configuration.logReplayChannel();
         private int logReplayStreamId = Configuration.logReplayStreamId();
-        private String timerChannel = Configuration.timerChannel();
-        private int timerStreamId = Configuration.timerStreamId();
+        private String consensusModuleChannel = Configuration.consensusModuleChannel();
+        private int consensusModuleStreamId = Configuration.consensusModuleStreamId();
         private boolean deleteDirOnStart = Configuration.deleteDirOnStart();
 
         private ThreadFactory threadFactory;
@@ -281,9 +320,10 @@ public final class ClusteredServiceContainer implements AutoCloseable
         private ErrorHandler errorHandler;
         private AtomicCounter errorCounter;
         private CountedErrorHandler countedErrorHandler;
-        private Aeron aeron;
         private AeronArchive.Context archiveContext;
         private File clusterDir;
+        private String aeronDirectoryName = CommonContext.AERON_DIR_PROP_DEFAULT;
+        private Aeron aeron;
         private boolean ownsAeronClient;
 
         private ClusteredService clusteredService;
@@ -325,17 +365,18 @@ public final class ClusteredServiceContainer implements AutoCloseable
             {
                 aeron = Aeron.connect(
                     new Aeron.Context()
+                        .aeronDirectoryName(aeronDirectoryName)
                         .errorHandler(countedErrorHandler)
-                        .epochClock(epochClock)
-                        .useConductorAgentInvoker(true)
-                        .clientLock(new NoOpLock()));
+                        .epochClock(epochClock));
 
                 ownsAeronClient = true;
             }
 
             if (null == archiveContext)
             {
-                archiveContext = new AeronArchive.Context().lock(new NoOpLock());
+                archiveContext = new AeronArchive.Context()
+                    .aeron(aeron)
+                    .lock(new NoOpLock());
             }
 
             if (deleteDirOnStart)
@@ -363,8 +404,32 @@ public final class ClusteredServiceContainer implements AutoCloseable
 
             if (null == clusterRecordingEventLog)
             {
-                clusterRecordingEventLog = new ClusterRecordingEventLog(clusterDir);
+                clusterRecordingEventLog = new ClusterRecordingEventLog(clusterDir, serviceId);
             }
+        }
+
+        /**
+         * Set the id for this clustered service.
+         *
+         * @param serviceId for this clustered service.
+         * @return this for a fluent API
+         * @see ClusteredServiceContainer.Configuration#SERVICE_ID_PROP_NAME
+         */
+        public Context serviceId(final long serviceId)
+        {
+            this.serviceId = serviceId;
+            return this;
+        }
+
+        /**
+         * Get the id for this clustered service.
+         *
+         * @return the id for this clustered service.
+         * @see ClusteredServiceContainer.Configuration#SERVICE_ID_PROP_NAME
+         */
+        public long serviceId()
+        {
+            return serviceId;
         }
 
         /**
@@ -464,51 +529,51 @@ public final class ClusteredServiceContainer implements AutoCloseable
         }
 
         /**
-         * Set the channel parameter for scheduling timer events channel.
+         * Set the channel parameter for sending messages to the Consensus Module.
          *
-         * @param channel parameter for the scheduling timer events channel.
+         * @param channel parameter for sending messages to the Consensus Module.
          * @return this for a fluent API.
-         * @see Configuration#TIMER_CHANNEL_PROP_NAME
+         * @see Configuration#CONSENSUS_MODULE_CHANNEL_PROP_NAME
          */
         public Context timerChannel(final String channel)
         {
-            timerChannel = channel;
+            consensusModuleChannel = channel;
             return this;
         }
 
         /**
-         * Get the channel parameter for the scheduling timer events channel.
+         * Get the channel parameter for sending messages to the Consensus Module.
          *
-         * @return the channel parameter for the scheduling timer events channel.
-         * @see Configuration#TIMER_CHANNEL_PROP_NAME
+         * @return the channel parameter for sending messages to the Consensus Module.
+         * @see Configuration#CONSENSUS_MODULE_CHANNEL_PROP_NAME
          */
         public String timerChannel()
         {
-            return timerChannel;
+            return consensusModuleChannel;
         }
 
         /**
-         * Set the stream id for the scheduling timer events channel.
+         * Set the stream id for sending messages to the Consensus Module.
          *
-         * @param streamId for the scheduling timer events channel.
+         * @param streamId for sending messages to the Consensus Module.
          * @return this for a fluent API
-         * @see Configuration#TIMER_STREAM_ID_PROP_NAME
+         * @see Configuration#CONSENSUS_MODULE_STREAM_ID_PROP_NAME
          */
-        public Context timerStreamId(final int streamId)
+        public Context consensusModuleStreamId(final int streamId)
         {
-            timerStreamId = streamId;
+            consensusModuleStreamId = streamId;
             return this;
         }
 
         /**
-         * Get the stream id for the scheduling timer events channel.
+         * Get the stream id for sending messages to the Consensus Module..
          *
-         * @return the stream id for the scheduling timer events channel.
-         * @see Configuration#TIMER_STREAM_ID_PROP_NAME
+         * @return the stream id for sending messages to the Consensus Module..
+         * @see Configuration#CONSENSUS_MODULE_STREAM_ID_PROP_NAME
          */
-        public int timerStreamId()
+        public int consensusModuleStreamId()
         {
-            return timerStreamId;
+            return consensusModuleStreamId;
         }
 
         /**
@@ -644,6 +709,28 @@ public final class ClusteredServiceContainer implements AutoCloseable
         }
 
         /**
+         * Set the top level Aeron directory used for communication between the Aeron client and Media Driver.
+         *
+         * @param aeronDirectoryName the top level Aeron directory.
+         * @return this for a fluent API.
+         */
+        public Context aeronDirectoryName(final String aeronDirectoryName)
+        {
+            this.aeronDirectoryName = aeronDirectoryName;
+            return this;
+        }
+
+        /**
+         * Get the top level Aeron directory used for communication between the Aeron client and Media Driver.
+         *
+         * @return The top level Aeron directory.
+         */
+        public String aeronDirectoryName()
+        {
+            return aeronDirectoryName;
+        }
+
+        /**
          * An {@link Aeron} client for the container.
          *
          * @return {@link Aeron} client for the container
@@ -664,17 +751,6 @@ public final class ClusteredServiceContainer implements AutoCloseable
         public Context aeron(final Aeron aeron)
         {
             this.aeron = aeron;
-            return this;
-        }
-
-        public ClusteredService clusteredService()
-        {
-            return clusteredService;
-        }
-
-        public Context clusteredService(final ClusteredService clusteredService)
-        {
-            this.clusteredService = clusteredService;
             return this;
         }
 
@@ -701,6 +777,28 @@ public final class ClusteredServiceContainer implements AutoCloseable
         }
 
         /**
+         * The service this container holds.
+         *
+         * @return service this container holds.
+         */
+        public ClusteredService clusteredService()
+        {
+            return clusteredService;
+        }
+
+        /**
+         * Set the service this container is to hold.
+         *
+         * @param clusteredService this container is to hold.
+         * @return this for fluent API.
+         */
+        public Context clusteredService(final ClusteredService clusteredService)
+        {
+            this.clusteredService = clusteredService;
+            return this;
+        }
+
+        /**
          * Set the {@link AeronArchive.Context} that should be used for communicating with the local Archive.
          *
          * @param archiveContext that should be used for communicating with the local Archive.
@@ -722,39 +820,79 @@ public final class ClusteredServiceContainer implements AutoCloseable
             return archiveContext;
         }
 
+        /**
+         * Should the container attempt to immediately delete {@link #clusterDir()} on startup.
+         *
+         * @param deleteDirOnStart Attempt deletion.
+         * @return this for a fluent API.
+         * @see Configuration#DIR_DELETE_ON_START_PROP_NAME
+         */
         public Context deleteDirOnStart(final boolean deleteDirOnStart)
         {
             this.deleteDirOnStart = deleteDirOnStart;
             return this;
         }
 
+        /**
+         * Will the driver attempt to immediately delete {@link #clusterDir()} on startup.
+         *
+         * @return true when directory will be deleted, otherwise false.
+         * @see Configuration#DIR_DELETE_ON_START_PROP_NAME
+         */
         public boolean deleteDirOnStart()
         {
             return deleteDirOnStart;
         }
 
+        /**
+         * Set the directory to use for the cluster container.
+         *
+         * @param clusterDir to use.
+         * @return this for a fluenat API.
+         * @see Configuration#CLUSTER_DIR_PROP_NAME
+         */
         public Context clusterDir(final File clusterDir)
         {
             this.clusterDir = clusterDir;
             return this;
         }
 
+        /**
+         * The directory used for the cluster container.
+         *
+         * @return directory for the cluster container.
+         * @see Configuration#CLUSTER_DIR_PROP_NAME
+         */
         public File clusterDir()
         {
             return clusterDir;
         }
 
+        /**
+         * Set the cluster recording event log to use.
+         *
+         * @param log to use.
+         * @return this for a fluent API.
+         */
         public Context clusterRecordingEventLog(final ClusterRecordingEventLog log)
         {
             clusterRecordingEventLog = log;
             return this;
         }
 
+        /**
+         * The cluster recording event log.
+         *
+         * @return cluster recording event log.
+         */
         public ClusterRecordingEventLog clusterRecordingEventLog()
         {
             return clusterRecordingEventLog;
         }
 
+        /**
+         * Delete the cluster container directory.
+         */
         public void deleteClusterDirectory()
         {
             if (null != clusterDir)

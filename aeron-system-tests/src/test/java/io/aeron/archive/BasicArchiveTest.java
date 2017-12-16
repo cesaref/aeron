@@ -17,9 +17,9 @@ package io.aeron.archive;
 
 import io.aeron.*;
 import io.aeron.archive.client.AeronArchive;
+import io.aeron.archive.status.RecordingPos;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
-import io.aeron.driver.status.SystemCounterDescriptor;
 import io.aeron.logbuffer.FragmentHandler;
 import org.agrona.CloseHelper;
 import org.agrona.ExpandableArrayBuffer;
@@ -29,6 +29,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import static io.aeron.archive.codecs.SourceLocation.LOCAL;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.core.Is.is;
 import static org.junit.Assert.assertEquals;
@@ -51,8 +52,7 @@ public class BasicArchiveTest
         .endpoint("localhost:6666")
         .build();
 
-    private MediaDriver driver;
-    private Archive archive;
+    private ArchivingMediaDriver archivingMediaDriver;
     private Aeron aeron;
     private AeronArchive aeronArchive;
 
@@ -61,23 +61,19 @@ public class BasicArchiveTest
     {
         final String aeronDirectoryName = CommonContext.generateRandomDirName();
 
-        driver = MediaDriver.launch(
+        archivingMediaDriver = ArchivingMediaDriver.launch(
             new MediaDriver.Context()
                 .aeronDirectoryName(aeronDirectoryName)
                 .termBufferSparseFile(true)
                 .threadingMode(ThreadingMode.SHARED)
                 .errorHandler(Throwable::printStackTrace)
-                .dirDeleteOnStart(true));
-
-        archive = Archive.launch(
+                .spiesSimulateConnection(false)
+                .dirDeleteOnStart(true),
             new Archive.Context()
                 .aeronDirectoryName(aeronDirectoryName)
                 .archiveDir(TestUtil.makeTempDir())
                 .fileSyncLevel(0)
-                .threadingMode(ArchiveThreadingMode.SHARED)
-                .mediaDriverAgentInvoker(driver.sharedAgentInvoker())
-                .errorHandler(driver.context().errorHandler())
-                .errorCounter(driver.context().systemCounters().get(SystemCounterDescriptor.ERRORS)));
+                .threadingMode(ArchiveThreadingMode.SHARED));
 
         aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(aeronDirectoryName));
 
@@ -90,12 +86,11 @@ public class BasicArchiveTest
     public void after()
     {
         CloseHelper.close(aeronArchive);
-        CloseHelper.close(archive);
         CloseHelper.close(aeron);
-        CloseHelper.close(driver);
+        CloseHelper.close(archivingMediaDriver);
 
-        archive.context().deleteArchiveDirectory();
-        driver.context().deleteAeronDirectory();
+        archivingMediaDriver.archive().context().deleteArchiveDirectory();
+        archivingMediaDriver.mediaDriver().context().deleteAeronDirectory();
     }
 
     @Test(timeout = 10000)
@@ -105,10 +100,17 @@ public class BasicArchiveTest
         final int messageCount = 10;
         final long length;
 
-        try (Publication publication = aeronArchive.addRecordedPublication(RECORDING_CHANNEL, RECORDING_STREAM_ID);
+        final long correlationId = aeronArchive.startRecording(RECORDING_CHANNEL, RECORDING_STREAM_ID, LOCAL);
+        final long recordingIdFromCounter;
+
+        try (Publication publication = aeron.addPublication(RECORDING_CHANNEL, RECORDING_STREAM_ID);
              Subscription subscription = aeron.addSubscription(RECORDING_CHANNEL, RECORDING_STREAM_ID))
         {
             offer(publication, messageCount, messagePrefix);
+
+            recordingIdFromCounter = RecordingPos.findActiveRecordingId(
+                aeron.countersReader(), aeronArchive.controlSessionId(), correlationId, publication.sessionId());
+
             consume(subscription, messageCount, messagePrefix);
 
             length = publication.position();
@@ -117,6 +119,8 @@ public class BasicArchiveTest
         aeronArchive.stopRecording(RECORDING_CHANNEL, RECORDING_STREAM_ID);
 
         final long recordingId = findRecordingId(RECORDING_CHANNEL, RECORDING_STREAM_ID, length);
+        assertEquals(recordingIdFromCounter, recordingId);
+
         final long fromPosition = 0L;
 
         try (Subscription subscription = aeronArchive.replay(

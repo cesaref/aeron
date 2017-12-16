@@ -218,7 +218,7 @@ public:
      *
      * @return next correlation id that is unique for the Media Driver.
      */
-    inline int64_t nextCorrelationId()
+    inline std::int64_t nextCorrelationId()
     {
         return m_toDriverRingBuffer.nextCorrelationId();
     }
@@ -273,6 +273,16 @@ public:
         return m_conductorInvoker;
     }
 
+    /**
+     * Get the CountersReader for the Aeron media driver counters.
+     *
+     * @return CountersReader for the Aeron media driver in use.
+     */
+    inline CountersReader& countersReader()
+    {
+        return m_conductor.countersReader();
+    }
+
 private:
     std::random_device m_randomDevice;
     std::default_random_engine m_randomEngine;
@@ -284,6 +294,7 @@ private:
 
     AtomicBuffer m_toDriverAtomicBuffer;
     AtomicBuffer m_toClientsAtomicBuffer;
+    AtomicBuffer m_countersMetadataBuffer;
     AtomicBuffer m_countersValueBuffer;
 
     ManyToOneRingBuffer m_toDriverRingBuffer;

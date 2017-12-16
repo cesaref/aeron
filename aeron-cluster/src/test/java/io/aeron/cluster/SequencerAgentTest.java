@@ -25,6 +25,11 @@ import org.agrona.concurrent.status.AtomicCounter;
 import org.junit.Before;
 import org.junit.Test;
 
+import static io.aeron.cluster.control.ClusterControl.Action.NEUTRAL;
+import static io.aeron.cluster.control.ClusterControl.Action.RESUME;
+import static io.aeron.cluster.control.ClusterControl.Action.SUSPEND;
+import static org.hamcrest.core.Is.is;
+import static org.junit.Assert.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
@@ -41,6 +46,8 @@ public class SequencerAgentTest
     private final ConsensusModule.Context ctx = new ConsensusModule.Context()
         .errorCounter(mock(AtomicCounter.class))
         .errorHandler(Throwable::printStackTrace)
+        .messageIndex(mock(Counter.class))
+        .controlToggle(mock(Counter.class))
         .aeron(mock(Aeron.class))
         .epochClock(new SystemEpochClock())
         .cachedEpochClock(new CachedEpochClock());
@@ -60,6 +67,7 @@ public class SequencerAgentTest
         final SequencerAgent agent = newSequencerAgent();
 
         final long correlationIdOne = 1L;
+        agent.onServiceReady(0L);
         agent.onSessionConnect(correlationIdOne, 2, RESPONSE_CHANNEL_ONE);
         agent.doWork();
 
@@ -87,6 +95,8 @@ public class SequencerAgentTest
         final SequencerAgent agent = newSequencerAgent();
 
         final long correlationId = 1L;
+        agent.onServiceReady(0L);
+
         agent.onSessionConnect(correlationId, 2, RESPONSE_CHANNEL_ONE);
         agent.doWork();
 
@@ -107,15 +117,42 @@ public class SequencerAgentTest
             .sendEvent(any(ClusterSession.class), eq(EventCode.ERROR), eq(SequencerAgent.SESSION_TIMEOUT_MSG));
     }
 
+    @Test
+    public void shouldTransitionStates()
+    {
+        final Counter mockControlToggle = mock(Counter.class);
+        ctx.controlToggle(mockControlToggle);
+
+        when(mockControlToggle.get()).thenReturn(NEUTRAL.code());
+
+        final SequencerAgent agent = newSequencerAgent();
+        assertThat(agent.state(), is(SequencerAgent.State.INIT));
+
+        agent.onServiceReady(1L);
+        assertThat(agent.state(), is(SequencerAgent.State.ACTIVE));
+
+        when(mockControlToggle.get()).thenReturn(SUSPEND.code());
+        agent.doWork();
+
+        assertThat(agent.state(), is(SequencerAgent.State.SUSPENDED));
+        verify(mockControlToggle).set(NEUTRAL.code());
+
+        when(mockControlToggle.get()).thenReturn(RESUME.code());
+        agent.doWork();
+
+        assertThat(agent.state(), is(SequencerAgent.State.ACTIVE));
+        verify(mockControlToggle, times(2)).set(NEUTRAL.code());
+    }
+
     private SequencerAgent newSequencerAgent()
     {
         return new SequencerAgent(
             ctx,
             mockEgressPublisher,
-            mock(Counter.class),
             mockLogAppender,
             (sequencerAgent) -> mock(IngressAdapter.class),
             (sequencerAgent) -> mock(TimerService.class),
-            (sessionId, responseStreamId, responseChannel) -> new ClusterSession(sessionId, null));
+            (sessionId, responseStreamId, responseChannel) -> new ClusterSession(sessionId, null),
+            (sequencerAgent) -> mock(ConsensusModuleAdapter.class));
     }
 }

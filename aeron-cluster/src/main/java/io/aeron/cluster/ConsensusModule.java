@@ -20,6 +20,7 @@ import io.aeron.Counter;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.archive.codecs.SourceLocation;
 import io.aeron.cluster.client.AeronCluster;
+import io.aeron.cluster.control.ClusterControl;
 import io.aeron.cluster.service.ClusteredServiceContainer;
 import org.agrona.CloseHelper;
 import org.agrona.ErrorHandler;
@@ -30,17 +31,21 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
+import static io.aeron.cluster.control.ClusterControl.CONTROL_TOGGLE_TYPE_ID;
 import static io.aeron.driver.status.SystemCounterDescriptor.SYSTEM_COUNTER_TYPE_ID;
 import static org.agrona.SystemUtil.getDurationInNanos;
 
-public class ConsensusModule
-    implements AutoCloseable, IngressAdapterSupplier, TimerServiceSupplier, ClusterSessionSupplier
+public class ConsensusModule implements
+    AutoCloseable,
+    IngressAdapterSupplier,
+    TimerServiceSupplier,
+    ClusterSessionSupplier,
+    ConsensusModuleAdapterSupplier
 {
     private static final int FRAGMENT_POLL_LIMIT = 10;
     private static final int TIMER_POLL_LIMIT = 10;
 
     private final Context ctx;
-    private final Counter messageIndex;
     private final LogAppender logAppender;
     private final AgentRunner conductorRunner;
 
@@ -54,11 +59,10 @@ public class ConsensusModule
             archive.startRecording(ctx.logChannel(), ctx.logStreamId(), SourceLocation.LOCAL);
         }
 
-        messageIndex = ctx.aeron().addCounter(SYSTEM_COUNTER_TYPE_ID, "Log message index");
         logAppender = new LogAppender(ctx.aeron().addExclusivePublication(ctx.logChannel(), ctx.logStreamId()));
 
         final SequencerAgent conductor = new SequencerAgent(
-            ctx, new EgressPublisher(), messageIndex, logAppender, this, this, this);
+            ctx, new EgressPublisher(), logAppender, this, this, this, this);
 
         conductorRunner = new AgentRunner(ctx.idleStrategy(), ctx.errorHandler(), ctx.errorCounter(), conductor);
     }
@@ -103,7 +107,6 @@ public class ConsensusModule
     public void close()
     {
         CloseHelper.close(conductorRunner);
-        CloseHelper.close(messageIndex);
         CloseHelper.close(logAppender);
         CloseHelper.close(ctx);
     }
@@ -118,18 +121,21 @@ public class ConsensusModule
 
     public TimerService newTimerService(final SequencerAgent sequencerAgent)
     {
-        return new TimerService(
-            TIMER_POLL_LIMIT,
-            FRAGMENT_POLL_LIMIT,
-            sequencerAgent,
-            ctx.aeron().addSubscription(ctx.timerChannel(), ctx.timerStreamId()),
-            ctx.cachedEpochClock());
+        return new TimerService(TIMER_POLL_LIMIT, sequencerAgent);
     }
 
     public ClusterSession newClusterSession(
         final long sessionId, final int responseStreamId, final String responseChannel)
     {
         return new ClusterSession(sessionId, ctx.aeron().addPublication(responseChannel, responseStreamId));
+    }
+
+    public ConsensusModuleAdapter newConsensusModuleAdapter(final SequencerAgent sequencerAgent)
+    {
+        return new ConsensusModuleAdapter(
+            FRAGMENT_POLL_LIMIT,
+            ctx.aeron().addSubscription(ctx.consensusModuleChannel(), ctx.consensusModuleStreamId()),
+            sequencerAgent);
     }
 
     /**
@@ -190,8 +196,8 @@ public class ConsensusModule
         private int ingressStreamId = AeronCluster.Configuration.ingressStreamId();
         private String logChannel = ClusteredServiceContainer.Configuration.logChannel();
         private int logStreamId = ClusteredServiceContainer.Configuration.logStreamId();
-        private String timerChannel = ClusteredServiceContainer.Configuration.timerChannel();
-        private int timerStreamId = ClusteredServiceContainer.Configuration.timerStreamId();
+        private String consensusModuleChannel = ClusteredServiceContainer.Configuration.consensusModuleChannel();
+        private int consensusModuleStreamId = ClusteredServiceContainer.Configuration.consensusModuleStreamId();
 
         private int maxConcurrentSessions = Configuration.maxConcurrentSessions();
         private long sessionTimeoutNs = Configuration.sessionTimeoutNs();
@@ -204,6 +210,9 @@ public class ConsensusModule
         private ErrorHandler errorHandler;
         private AtomicCounter errorCounter;
         private CountedErrorHandler countedErrorHandler;
+
+        private Counter messageIndex;
+        private Counter controlToggle;
 
         private AeronArchive.Context archiveContext;
 
@@ -253,6 +262,16 @@ public class ConsensusModule
                 {
                     aeron.context().errorHandler(countedErrorHandler);
                 }
+            }
+
+            if (null == messageIndex)
+            {
+                messageIndex = aeron.addCounter(SYSTEM_COUNTER_TYPE_ID, "Log message index");
+            }
+
+            if (null == controlToggle)
+            {
+                controlToggle = aeron.addCounter(CONTROL_TOGGLE_TYPE_ID, "Control toggle");
             }
 
             if (null == threadFactory)
@@ -368,51 +387,51 @@ public class ConsensusModule
         }
 
         /**
-         * Set the channel parameter for scheduling timer events channel.
+         * Set the channel parameter for sending messages to the Consensus Module.
          *
-         * @param channel parameter for the scheduling timer events channel.
+         * @param channel parameter for sending messages to the Consensus Module.
          * @return this for a fluent API.
-         * @see ClusteredServiceContainer.Configuration#TIMER_CHANNEL_PROP_NAME
+         * @see ClusteredServiceContainer.Configuration#CONSENSUS_MODULE_CHANNEL_PROP_NAME
          */
-        public Context timerChannel(final String channel)
+        public Context consensusModuleChannel(final String channel)
         {
-            timerChannel = channel;
+            consensusModuleChannel = channel;
             return this;
         }
 
         /**
-         * Get the channel parameter for the scheduling timer events channel.
+         * Get the channel parameter for sending messages to the Consensus Module.
          *
-         * @return the channel parameter for the scheduling timer events channel.
-         * @see ClusteredServiceContainer.Configuration#TIMER_CHANNEL_PROP_NAME
+         * @return the channel parameter for sending messages to the Consensus Module.
+         * @see ClusteredServiceContainer.Configuration#CONSENSUS_MODULE_CHANNEL_PROP_NAME
          */
-        public String timerChannel()
+        public String consensusModuleChannel()
         {
-            return timerChannel;
+            return consensusModuleChannel;
         }
 
         /**
-         * Set the stream id for the scheduling timer events channel.
+         * Set the stream id for sending messages to the Consensus Module.
          *
-         * @param streamId for the scheduling timer events channel.
+         * @param streamId for sending messages to the Consensus Module.
          * @return this for a fluent API
-         * @see ClusteredServiceContainer.Configuration#TIMER_STREAM_ID_PROP_NAME
+         * @see ClusteredServiceContainer.Configuration#CONSENSUS_MODULE_STREAM_ID_PROP_NAME
          */
-        public Context timerStreamId(final int streamId)
+        public Context consensusModuleStreamId(final int streamId)
         {
-            timerStreamId = streamId;
+            consensusModuleStreamId = streamId;
             return this;
         }
 
         /**
-         * Get the stream id for the scheduling timer events channel.
+         * Get the stream id for sending messages to the Consensus Module.
          *
          * @return the stream id for the scheduling timer events channel.
-         * @see ClusteredServiceContainer.Configuration#TIMER_STREAM_ID_PROP_NAME
+         * @see ClusteredServiceContainer.Configuration#CONSENSUS_MODULE_STREAM_ID_PROP_NAME
          */
-        public int timerStreamId()
+        public int consensusModuleStreamId()
         {
-            return timerStreamId;
+            return consensusModuleStreamId;
         }
 
         /**
@@ -618,6 +637,52 @@ public class ConsensusModule
         }
 
         /**
+         * Get the counter for the message index of the log.
+         *
+         * @return the counter for the message index of the log.
+         */
+        public Counter messageIndex()
+        {
+            return messageIndex;
+        }
+
+        /**
+         * Set the counter for the message index of the log.
+         *
+         * @param messageIndex the counter for the message index of the log.
+         * @return this for a fluent API.
+         */
+        public Context messageIndex(final Counter messageIndex)
+        {
+            this.messageIndex = messageIndex;
+            return this;
+        }
+
+        /**
+         * Get the counter for the control toggle for triggering actions on the cluster node.
+         *
+         * @return the counter for triggering cluster node actions.
+         * @see ClusterControl
+         */
+        public Counter controlToggle()
+        {
+            return controlToggle;
+        }
+
+        /**
+         * Set the counter for the control toggle for triggering actions on the cluster node.
+         *
+         * @param controlToggle the counter for triggering cluster node actions.
+         * @return this for a fluent API.
+         * @see ClusterControl
+         */
+        public Context controlToggle(final Counter controlToggle)
+        {
+            this.controlToggle = controlToggle;
+            return this;
+        }
+
+        /**
          * {@link Aeron} client for communicating with the local Media Driver.
          * <p>
          * This client will be closed when the {@link ConsensusModule#close()} or {@link #close()} methods are called
@@ -700,6 +765,11 @@ public class ConsensusModule
             if (ownsAeronClient)
             {
                 CloseHelper.close(aeron);
+            }
+            else
+            {
+                CloseHelper.close(messageIndex);
+                CloseHelper.close(controlToggle);
             }
         }
     }
