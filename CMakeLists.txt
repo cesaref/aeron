@@ -45,12 +45,23 @@ endif(NOT CMAKE_BUILD_TYPE)
 
 ##########################################################
 # gmock usage
+set(GMOCK_INSTALL_DIR ${CMAKE_BINARY_DIR}/gmock)
+
+set(GMOCK_LIBS
+    ${GMOCK_INSTALL_DIR}/lib/${CMAKE_CFG_INTDIR}/${CMAKE_STATIC_LIBRARY_PREFIX}gmock${CMAKE_STATIC_LIBRARY_SUFFIX}
+    ${GMOCK_INSTALL_DIR}/lib/${CMAKE_CFG_INTDIR}/${CMAKE_STATIC_LIBRARY_PREFIX}gmock_main${CMAKE_STATIC_LIBRARY_SUFFIX}
+)
 
 ExternalProject_Add(
     gmock
     URL ${CMAKE_CURRENT_SOURCE_DIR}/cppbuild/googletest-release-1.8.0.zip
     URL_MD5 adfafc8512ab65fd3cf7955ef0100ff5
-    INSTALL_COMMAND ""
+    INSTALL_DIR
+        ${GMOCK_INSTALL_DIR}
+    CMAKE_ARGS
+        -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
+    BUILD_BYPRODUCTS
+        ${GMOCK_LIBS}
 )
 
 ExternalProject_Get_Property(gmock source_dir)
@@ -58,29 +69,28 @@ set(GMOCK_SOURCE_DIR ${source_dir})
 ExternalProject_Get_Property(gmock binary_dir)
 set(GMOCK_BINARY_DIR ${binary_dir})
 
-set(GMOCK_LIBS
-    ${GMOCK_BINARY_DIR}/googlemock/${CMAKE_CFG_INTDIR}/${CMAKE_STATIC_LIBRARY_PREFIX}gmock${CMAKE_STATIC_LIBRARY_SUFFIX}
-    ${GMOCK_BINARY_DIR}/googlemock/${CMAKE_CFG_INTDIR}/${CMAKE_STATIC_LIBRARY_PREFIX}gmock_main${CMAKE_STATIC_LIBRARY_SUFFIX}
-)
 
 ##########################################################
 # HdrHistogram usage - use MD5 as means to identify snapshot
+
+set(HDRHISTOGRAM_INSTALL_DIR ${CMAKE_BINARY_DIR}/hdr_histogram)
+
+set(HDRHISTOGRAM_LIBS
+    ${HDRHISTOGRAM_INSTALL_DIR}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}hdr_histogram_static${CMAKE_STATIC_LIBRARY_SUFFIX}
+)
 
 ExternalProject_Add(
     hdr_histogram
     URL ${CMAKE_CURRENT_SOURCE_DIR}/cppbuild/HdrHistogram_c.zip
     URL_MD5 8d1d6c6df1ee8342c180529a89568081
-    INSTALL_COMMAND ""
+    INSTALL_DIR
+        ${HDRHISTOGRAM_INSTALL_DIR}
+    CMAKE_ARGS
+        -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
+    BUILD_BYPRODUCTS
+        ${HDRHISTOGRAM_LIBS}
 )
 
-ExternalProject_Get_Property(hdr_histogram source_dir)
-set(HDRHISTOGRAM_SOURCE_DIR ${source_dir})
-ExternalProject_Get_Property(hdr_histogram binary_dir)
-set(HDRHISTOGRAM_BINARY_DIR ${binary_dir})
-
-set(HDRHISTOGRAM_LIBS
-    ${HDRHISTOGRAM_BINARY_DIR}/src/${CMAKE_STATIC_LIBRARY_PREFIX}hdr_histogram_static${CMAKE_STATIC_LIBRARY_SUFFIX}
-)
 
 ##########################################################
 # Google benchmark
@@ -197,7 +207,7 @@ include_directories(${GMOCK_SOURCE_DIR}/googletest/include)
 include_directories(${GMOCK_SOURCE_DIR}/googlemock/include)
 
 # hdr_histogram
-include_directories(${HDRHISTOGRAM_SOURCE_DIR}/src)
+include_directories(${HDRHISTOGRAM_INSTALL_DIR}/include/hdr)
 
 # google benchmark
 include_directories(${GOOGLE_BENCHMARK_SOURCE_DIR}/include)

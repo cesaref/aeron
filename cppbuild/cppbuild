@@ -4,6 +4,8 @@ SOURCE_DIR="`pwd`"
 BUILD_DIR="`pwd`/cppbuild/Release"
 EXTRA_CMAKE_ARGS=""
 COVERAGE_BUILD=0
+CMAKE_GENERATOR="CodeBlocks - Unix Makefiles"
+BUILD_TYPE="Release"
 
 for option in "$@"
 do
@@ -39,8 +41,24 @@ do
       fi
       shift
       ;;
+    --generator=*)
+      CMAKE_GENERATOR="${option#*=}"
+      echo "Setting generator to \"$CMAKE_GENERATOR\""
+      shift
+      ;;
+    --build-dir=*)
+      BUILD_DIR="${option#*=}"
+      echo "Setting build dir to \"$BUILD_DIR\""
+      shift
+      ;;
+    --build-type=*)
+      BUILD_TYPE="${option#*=}"
+      EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCMAKE_CONFIGURATION_TYPES=$BUILD_TYPE"
+      echo "Setting build type to \"$BUILD_TYPE\""
+      shift
+      ;;
     -h|--help)
-      echo "$0 [--c-warnings-as-errors] [--cxx-warnings-as-errors] [--build-aeron-driver] [--sanitise-build] [--coverage-build]"
+      echo "$0 [--c-warnings-as-errors] [--cxx-warnings-as-errors] [--build-aeron-driver] [--sanitise-build] [--coverage-build] [--generator=<cmake generator>] [--build-dir=<directory>]"
       exit
       ;;
     *)
@@ -72,12 +90,12 @@ mkdir -p $BUILD_DIR
 
 if [ "$COVERAGE_BUILD" -eq 1 ] ; then
   cd $BUILD_DIR
-  cmake -G "Unix Makefiles" $EXTRA_CMAKE_ARGS $SOURCE_DIR && make clean && make -j "$ncpus" all && ctest -C Release -j "$ncpus"
+  cmake -G "$CMAKE_GENERATOR" $EXTRA_CMAKE_ARGS $SOURCE_DIR && cmake --build . --config $BUILD_TYPE -- -j $ncpus && ctest -C $BUILD_TYPE -j $ncpus
   rm -rf coverage
   mkdir -p coverage
   lcov --directory . --base-directory . --capture -o coverage/cov.info
   lcov -o coverage/cov.stripped.info --remove coverage/cov.info "/usr/include/*" "*/googletest/*" "*/test/cpp/*" "*/googlemock/*"
   genhtml coverage/cov.stripped.info --demangle-cpp -o coverage
 else
-  (cd $BUILD_DIR && cmake -G "CodeBlocks - Unix Makefiles" $EXTRA_CMAKE_ARGS $SOURCE_DIR && make clean && make -j "$ncpus" all && ctest -C Release -j "$ncpus")
+  (cd $BUILD_DIR && cmake -G "$CMAKE_GENERATOR" $EXTRA_CMAKE_ARGS $SOURCE_DIR && cmake --build . --config $BUILD_TYPE -- -j $ncpus && ctest -C $BUILD_TYPE -j $ncpus)
 fi
