@@ -6,6 +6,7 @@ EXTRA_CMAKE_ARGS=""
 COVERAGE_BUILD=0
 CMAKE_GENERATOR="CodeBlocks - Unix Makefiles"
 BUILD_TYPE="Release"
+CPUS=0
 
 for option in "$@"
 do
@@ -41,6 +42,11 @@ do
       fi
       shift
       ;;
+    --cpus=*)
+      CPUS="${option#*=}"
+      echo "Setting cpus to \"$CPUS\""
+      shift
+      ;;
     --generator=*)
       CMAKE_GENERATOR="${option#*=}"
       echo "Setting generator to \"$CMAKE_GENERATOR\""
@@ -58,7 +64,7 @@ do
       shift
       ;;
     -h|--help)
-      echo "$0 [--c-warnings-as-errors] [--cxx-warnings-as-errors] [--build-aeron-driver] [--sanitise-build] [--coverage-build] [--generator=<cmake generator>] [--build-dir=<directory>]"
+      echo "$0 [--c-warnings-as-errors] [--cxx-warnings-as-errors] [--build-aeron-driver] [--sanitise-build] [--coverage-build] [--generator=<cmake generator>] [--build-dir=<directory>] [--cpus=<parallelism>]"
       exit
       ;;
     *)
@@ -69,17 +75,18 @@ do
   esac
 done
 
-ncpus=1
-case "`uname`" in
-  Darwin* )
-    ncpus=`sysctl -n hw.ncpu`
-    ;;
-  Linux*)
-    ncpus=$(lscpu -p | egrep -v '^#' | wc -l)
-    ;;
-esac
+if [ "$CPUS" -eq 0 ] ; then
+  case "`uname`" in
+    Darwin* )
+      CPUS=`sysctl -n hw.ncpu`
+      ;;
+    Linux*)
+      CPUS=$(lscpu -p | egrep -v '^#' | wc -l)
+      ;;
+  esac
+fi
 
-echo "Will make with \"-j $ncpus\"."
+echo "Will make with \"-j $CPUS\"."
 
 if [ -d "$BUILD_DIR" ] ; then
   echo "Build directory ($BUILD_DIR) exists, removing."
@@ -90,12 +97,12 @@ mkdir -p $BUILD_DIR
 
 if [ "$COVERAGE_BUILD" -eq 1 ] ; then
   cd $BUILD_DIR
-  cmake -G "$CMAKE_GENERATOR" $EXTRA_CMAKE_ARGS $SOURCE_DIR && cmake --build . --config $BUILD_TYPE -- -j $ncpus && ctest -C $BUILD_TYPE -j $ncpus
+  cmake -G "$CMAKE_GENERATOR" $EXTRA_CMAKE_ARGS $SOURCE_DIR && cmake --build . --config $BUILD_TYPE -- -j $CPUS && ctest -C $BUILD_TYPE -j $CPUS
   rm -rf coverage
   mkdir -p coverage
   lcov --directory . --base-directory . --capture -o coverage/cov.info
   lcov -o coverage/cov.stripped.info --remove coverage/cov.info "/usr/include/*" "*/googletest/*" "*/test/cpp/*" "*/googlemock/*"
   genhtml coverage/cov.stripped.info --demangle-cpp -o coverage
 else
-  (cd $BUILD_DIR && cmake -G "$CMAKE_GENERATOR" $EXTRA_CMAKE_ARGS $SOURCE_DIR && cmake --build . --config $BUILD_TYPE -- -j $ncpus && ctest -C $BUILD_TYPE -j $ncpus)
+  (cd $BUILD_DIR && cmake -G "$CMAKE_GENERATOR" $EXTRA_CMAKE_ARGS $SOURCE_DIR && cmake --build . --config $BUILD_TYPE -- -j $CPUS && ctest -C $BUILD_TYPE -j $CPUS)
 fi
