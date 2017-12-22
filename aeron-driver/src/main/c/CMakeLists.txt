@@ -268,6 +268,7 @@ target_link_libraries(
 
 target_link_libraries(
     aeron_driver_agent
+    aeron_driver
     ${CMAKE_DL_LIBS}
     ${AERON_LIB_BSD_LIBS}
     ${AERON_LIB_UUID_LIBS}
