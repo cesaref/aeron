@@ -73,6 +73,29 @@ set(GMOCK_BINARY_DIR ${binary_dir})
 
 
 ##########################################################
+# ZLIB - use MD5 as means to identify snapshot
+
+if(WIN32)
+    set(ZLIB_INSTALL_DIR ${CMAKE_BINARY_DIR}/zlib)
+
+    set(ZLIB_LIBS
+        ${ZLIB_INSTALL_DIR}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}z${CMAKE_STATIC_LIBRARY_SUFFIX}
+    )
+
+    ExternalProject_Add(
+        zlib
+        URL ${CMAKE_CURRENT_SOURCE_DIR}/cppbuild/zlib-1.2.11.tar.gz
+        URL_MD5 1c9f62f0778697a09d36121ead88e08e
+        INSTALL_DIR
+            ${ZLIB_INSTALL_DIR}
+        CMAKE_ARGS
+            -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
+        BUILD_BYPRODUCTS
+            ${ZLIB_LIBS}
+    )
+endif()
+
+##########################################################
 # HdrHistogram usage - use MD5 as means to identify snapshot
 
 set(HDRHISTOGRAM_INSTALL_DIR ${CMAKE_BINARY_DIR}/hdr_histogram)

@@ -39,6 +39,11 @@ target_link_libraries(AeronStat
     aeron_client
     ${CMAKE_THREAD_LIBS_INIT})
 
+if(WIN32)
+    target_link_libraries(AeronStat
+        ${ZLIB_LIBS})
+endif()
+
 target_link_libraries(BasicPublisher
     aeron_client
     ${CMAKE_THREAD_LIBS_INIT})
