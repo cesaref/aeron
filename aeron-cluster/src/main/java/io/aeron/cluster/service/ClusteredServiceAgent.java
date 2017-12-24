@@ -19,8 +19,8 @@ import io.aeron.*;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.archive.codecs.SourceLocation;
 import io.aeron.archive.status.RecordingPos;
-import io.aeron.cluster.RecordingInfo;
 import io.aeron.cluster.codecs.*;
+import io.aeron.exceptions.TimeoutException;
 import io.aeron.logbuffer.BufferClaim;
 import io.aeron.logbuffer.ControlledFragmentHandler;
 import io.aeron.logbuffer.Header;
@@ -28,13 +28,22 @@ import io.aeron.status.ReadableCounter;
 import org.agrona.CloseHelper;
 import org.agrona.DirectBuffer;
 import org.agrona.collections.Long2ObjectHashMap;
-import org.agrona.collections.MutableLong;
+import org.agrona.collections.MutableBoolean;
 import org.agrona.concurrent.*;
 import org.agrona.concurrent.status.CountersReader;
 
-public class ClusteredServiceAgent implements
-    ControlledFragmentHandler, Agent, Cluster, AvailableImageHandler, UnavailableImageHandler
+import java.util.concurrent.TimeUnit;
+
+import static io.aeron.CommonContext.IPC_CHANNEL;
+import static io.aeron.CommonContext.SPY_PREFIX;
+
+public class ClusteredServiceAgent implements ControlledFragmentHandler, Agent, Cluster
 {
+    /**
+     * Type of snapshot for this agent.
+     */
+    public static final long SNAPSHOT_TYPE_ID = 1;
+
     /**
      * Length of the session header that will precede application protocol message.
      */
@@ -44,61 +53,85 @@ public class ClusteredServiceAgent implements
     private static final int SEND_ATTEMPTS = 3;
     private static final int FRAGMENT_LIMIT = 10;
     private static final int INITIAL_BUFFER_LENGTH = 4096;
+    private static final long TIMEOUT_NS = TimeUnit.SECONDS.toNanos(5);
 
     private final long serviceId;
-    private long recordingStartPosition = 0;
+    private long leadershipTermStartPosition = 0;
     private long messageIndex;
     private long timestampMs;
     private final boolean shouldCloseResources;
+    private final EpochClock epochClock;
     private final Aeron aeron;
     private final ClusteredService service;
     private final Subscription logSubscription;
     private final ExclusivePublication consensusModulePublication;
-    private final ControlledFragmentAssembler fragmentAssembler =
-        new ControlledFragmentAssembler(this, INITIAL_BUFFER_LENGTH, true);
+    private final ControlledFragmentAssembler fragmentAssembler = new ControlledFragmentAssembler(
+        this, INITIAL_BUFFER_LENGTH, true);
     private final MessageHeaderDecoder messageHeaderDecoder = new MessageHeaderDecoder();
     private final SessionOpenEventDecoder openEventDecoder = new SessionOpenEventDecoder();
     private final SessionCloseEventDecoder closeEventDecoder = new SessionCloseEventDecoder();
     private final SessionHeaderDecoder sessionHeaderDecoder = new SessionHeaderDecoder();
     private final TimerEventDecoder timerEventDecoder = new TimerEventDecoder();
+    private final ServiceActionRequestDecoder actionRequestDecoder = new ServiceActionRequestDecoder();
     private final BufferClaim bufferClaim = new BufferClaim();
     private final MessageHeaderEncoder messageHeaderEncoder = new MessageHeaderEncoder();
     private final ScheduleTimerRequestEncoder scheduleTimerRequestEncoder = new ScheduleTimerRequestEncoder();
     private final CancelTimerRequestEncoder cancelTimerRequestEncoder = new CancelTimerRequestEncoder();
+    private final ServiceActionAckEncoder serviceActionAckEncoder = new ServiceActionAckEncoder();
+    private final ClientSessionEncoder clientSessionEncoder = new ClientSessionEncoder();
 
     private final Long2ObjectHashMap<ClientSession> sessionByIdMap = new Long2ObjectHashMap<>();
+    private final IdleStrategy idleStrategy;
 
     private final RecordingIndex recordingIndex;
     private final AeronArchive.Context archiveCtx;
     private final ClusteredServiceContainer.Context ctx;
 
-    private ReadableCounter recordingPositionCounter;
-    private volatile Image latestLogImage;
+    private ReadableCounter recordingPosition;
+    private Image logImage;
+    private State state = State.INIT;
 
     public ClusteredServiceAgent(final ClusteredServiceContainer.Context ctx)
     {
         this.ctx = ctx;
 
+        archiveCtx = ctx.archiveContext();
         serviceId = ctx.serviceId();
+        epochClock = ctx.epochClock();
         aeron = ctx.aeron();
         shouldCloseResources = ctx.ownsAeronClient();
         service = ctx.clusteredService();
-        logSubscription = aeron.addSubscription(ctx.logChannel(), ctx.logStreamId(), this, this);
+        recordingIndex = ctx.recordingIndex();
+        idleStrategy = ctx.idleStrategy();
+
+        String logChannel = ctx.logChannel();
+        logChannel = logChannel.contains(IPC_CHANNEL) ? logChannel : SPY_PREFIX + logChannel;
+
+        logSubscription = aeron.addSubscription(logChannel, ctx.logStreamId());
+
         consensusModulePublication = aeron.addExclusivePublication(
             ctx.consensusModuleChannel(), ctx.consensusModuleStreamId());
-        recordingIndex = ctx.recordingIndex();
-        archiveCtx = ctx.archiveContext();
     }
 
     public void onStart()
     {
         service.onStart(this);
-        replayPreviousLogs();
-        notifyReady();
+
+        recoverState();
+
+        final long recordingId = findRecordingPositionCounter();
+        recordingIndex.appendLog(recordingId, leadershipTermStartPosition, messageIndex);
+
+        logImage = logSubscription.imageAtIndex(0);
+        state = State.LEADING;
+
+        sendAcknowledgment(ServiceAction.READY, leadershipTermStartPosition);
     }
 
     public void onClose()
     {
+        state = State.CLOSED;
+
         if (shouldCloseResources)
         {
             CloseHelper.close(logSubscription);
@@ -117,10 +150,10 @@ public class ClusteredServiceAgent implements
     {
         int workCount = 0;
 
-        if (null != latestLogImage)
+        workCount += logImage.boundedControlledPoll(fragmentAssembler, recordingPosition.get(), FRAGMENT_LIMIT);
+        if (0 == workCount && logImage.isClosed())
         {
-            workCount += latestLogImage.boundedControlledPoll(
-                fragmentAssembler, recordingPositionCounter.get(), FRAGMENT_LIMIT);
+            throw new IllegalStateException("Image closed unexpectedly");
         }
 
         return workCount;
@@ -213,9 +246,17 @@ public class ClusteredServiceAgent implements
                 break;
             }
 
-            case SnapshotRequestDecoder.TEMPLATE_ID:
+            case ServiceActionRequestDecoder.TEMPLATE_ID:
             {
-                takeSnapshot();
+                actionRequestDecoder.wrap(
+                    buffer,
+                    offset + MessageHeaderDecoder.ENCODED_LENGTH,
+                    messageHeaderDecoder.blockLength(),
+                    messageHeaderDecoder.version());
+
+                timestampMs = actionRequestDecoder.timestamp();
+                final long resultingPosition = leadershipTermStartPosition + header.position();
+                executeAction(actionRequestDecoder.action(), resultingPosition);
                 break;
             }
         }
@@ -223,6 +264,11 @@ public class ClusteredServiceAgent implements
         ++messageIndex;
 
         return Action.CONTINUE;
+    }
+
+    public State state()
+    {
+        return state;
     }
 
     public Aeron aeron()
@@ -240,20 +286,11 @@ public class ClusteredServiceAgent implements
         return timestampMs;
     }
 
-    public long logPosition()
-    {
-        return recordingStartPosition + (null == latestLogImage ? 0L : latestLogImage.position());
-    }
-
-    public long messageIndex()
-    {
-        return messageIndex;
-    }
-
     public void scheduleTimer(final long correlationId, final long deadlineMs)
     {
         final int length = MessageHeaderEncoder.ENCODED_LENGTH + ScheduleTimerRequestEncoder.BLOCK_LENGTH;
 
+        idleStrategy.reset();
         int attempts = SEND_ATTEMPTS;
         do
         {
@@ -270,7 +307,7 @@ public class ClusteredServiceAgent implements
                 return;
             }
 
-            Thread.yield();
+            idleStrategy.idle();
         }
         while (--attempts > 0);
 
@@ -281,6 +318,7 @@ public class ClusteredServiceAgent implements
     {
         final int length = MessageHeaderEncoder.ENCODED_LENGTH + CancelTimerRequestEncoder.BLOCK_LENGTH;
 
+        idleStrategy.reset();
         int attempts = SEND_ATTEMPTS;
         do
         {
@@ -296,107 +334,98 @@ public class ClusteredServiceAgent implements
                 return;
             }
 
-            Thread.yield();
+            idleStrategy.idle();
         }
         while (--attempts > 0);
 
         throw new IllegalStateException("Failed to schedule timer");
     }
 
-    public void onAvailableImage(final Image image)
+    private long findRecordingPositionCounter()
     {
-        // TODO: make sessionId specific?
-        // TODO: Need to append a new recording.
-        latestLogImage = image;
+        final long deadlineNs = epochClock.time() + TIMEOUT_NS;
+
+        idleStrategy.reset();
+        while (!logSubscription.isConnected())
+        {
+            if (epochClock.time() > deadlineNs)
+            {
+                throw new TimeoutException("Failed to connect to cluster log");
+            }
+
+            checkInterruptedStatus();
+            idleStrategy.idle();
+        }
+
+        final int sessionId = logSubscription.imageAtIndex(0).sessionId();
+        final CountersReader countersReader = aeron.countersReader();
+
+        int recordingCounterId = RecordingPos.findActiveRecordingCounterIdBySession(countersReader, sessionId);
+        while (RecordingPos.NULL_COUNTER_ID == recordingCounterId)
+        {
+            if (epochClock.time() > deadlineNs)
+            {
+                throw new TimeoutException("Failed to find active recording position");
+            }
+
+            checkInterruptedStatus();
+            idleStrategy.idle();
+
+            recordingCounterId = RecordingPos.findActiveRecordingCounterIdBySession(countersReader, sessionId);
+        }
+
+        final long recordingId = RecordingPos.getActiveRecordingId(countersReader, recordingCounterId);
+
+        recordingPosition = new ReadableCounter(countersReader, recordingCounterId);
+
+        return recordingId;
     }
 
-    public void onUnavailableImage(final Image image)
+    private void recoverState()
     {
-        latestLogImage = null;
-    }
+        state = State.RECOVERING;
 
-    private void replayPreviousLogs()
-    {
         try (AeronArchive aeronArchive = AeronArchive.connect(archiveCtx))
         {
-            final IdleStrategy idleStrategy = new BackoffIdleStrategy(100, 100, 100, 1000);
-            final CountersReader countersReader = aeron.countersReader();
-
-            final Long2ObjectHashMap<RecordingInfo> recordingsMap = RecordingInfo.mapRecordings(
-                aeronArchive, 0, 100, logSubscription.channel(), logSubscription.streamId());
-
-            if (recordingsMap.size() == 0)
-            {
-                throw new IllegalStateException("could not find any log recordings");
-            }
-
-            final RecordingInfo latestRecordingInfo = RecordingInfo.findLatestRecording(recordingsMap);
-            final int recordingPositionCounterId =
-                RecordingPos.findActiveRecordingPositionCounterId(countersReader, latestRecordingInfo.recordingId);
-
-            if (recordingPositionCounterId == RecordingPos.NULL_COUNTER_ID)
-            {
-                throw new IllegalStateException("could not find latest recording position counter Id");
-            }
-
-            recordingPositionCounter = new ReadableCounter(countersReader, recordingPositionCounterId);
-
-            final MutableLong lastReplayedRecordingId = new MutableLong(-1);
-
             recordingIndex.forEachFromLastSnapshot(
-                (type, id, logPosition, messageIndex) ->
+                (type, recordingId, logPosition, messageIndex) ->
                 {
-                    final RecordingInfo recordingInfo = recordingsMap.get(id);
-                    lastReplayedRecordingId.value = id;
+                    final RecordingInfo recordingInfo = new RecordingInfo();
+                    if (0 == aeronArchive.listRecording(recordingId, recordingInfo))
+                    {
+                        throw new IllegalStateException("Could not find recordingId: " + recordingId);
+                    }
 
-                    recordingStartPosition = logPosition;
+                    leadershipTermStartPosition = logPosition;
                     this.messageIndex = messageIndex;
 
                     if (RecordingIndex.RECORDING_TYPE_SNAPSHOT == type)
                     {
-                        loadSnapshot(idleStrategy, aeronArchive, recordingInfo);
+                        loadSnapshot(aeronArchive, recordingInfo);
                     }
                     else if (RecordingIndex.RECORDING_TYPE_LOG == type)
                     {
-                        replayRecordedLog(idleStrategy, aeronArchive, recordingInfo);
+                        replayRecordedLog(aeronArchive, recordingInfo);
                     }
                 });
-
-            while (!logSubscription.isConnected() && null == latestLogImage)
-            {
-                idleStrategy.idle();
-            }
-
-            if (lastReplayedRecordingId.value != latestRecordingInfo.recordingId)
-            {
-                recordingIndex.appendLog(latestRecordingInfo.recordingId, recordingStartPosition, messageIndex);
-            }
         }
     }
 
-    private void replayRecordedLog(
-        final IdleStrategy idleStrategy, final AeronArchive aeronArchive, final RecordingInfo recordingInfo)
+    private void replayRecordedLog(final AeronArchive archive, final RecordingInfo recordingInfo)
     {
-        if (null == recordingInfo)
-        {
-            throw new IllegalStateException("could not find log recording");
-        }
-
         final long length = recordingInfo.stopPosition - recordingInfo.startPosition;
-        if (length == 0)
-        {
-            return;
-        }
 
-        try (Subscription replaySubscription = aeronArchive.replay(
-             recordingInfo.recordingId,
-             recordingInfo.startPosition,
-             length,
-             ctx.replayChannel(),
-             ctx.replayStreamId()))
+        try (Subscription replaySubscription = archive.replay(
+            recordingInfo.recordingId,
+            recordingInfo.startPosition,
+            length,
+            ctx.replayChannel(),
+            ctx.replayStreamId()))
         {
+            idleStrategy.reset();
             while (!replaySubscription.isConnected())
             {
+                checkInterruptedStatus();
                 idleStrategy.idle();
             }
 
@@ -417,107 +446,18 @@ public class ClusteredServiceAgent implements
                         throw new IllegalStateException("Unexpected close of replay");
                     }
 
-                    if (Thread.currentThread().isInterrupted())
-                    {
-                        throw new AgentTerminationException("Unexpected interrupt during replay");
-                    }
+                    checkInterruptedStatus();
                 }
 
                 idleStrategy.idle(workCount);
             }
+
+            leadershipTermStartPosition += length;
         }
     }
 
-    private void notifyReady()
+    private void loadSnapshot(final AeronArchive aeronArchive, final RecordingInfo recordingInfo)
     {
-        final ServiceReadyEncoder encoder = new ServiceReadyEncoder();
-        final int length = MessageHeaderEncoder.ENCODED_LENGTH + ServiceReadyEncoder.BLOCK_LENGTH;
-
-        int attempts = SEND_ATTEMPTS;
-        do
-        {
-            if (consensusModulePublication.tryClaim(length, bufferClaim) > 0)
-            {
-                encoder
-                    .wrapAndApplyHeader(bufferClaim.buffer(), bufferClaim.offset(), messageHeaderEncoder)
-                    .serviceId(serviceId);
-
-                bufferClaim.commit();
-
-                return;
-            }
-
-            Thread.yield();
-        }
-        while (--attempts > 0);
-
-        throw new IllegalStateException("Failed to notify ready");
-    }
-
-    private void notifySnapshotTaken()
-    {
-        final SnapshotTakenEncoder encoder = new SnapshotTakenEncoder();
-        final int length = MessageHeaderEncoder.ENCODED_LENGTH + ServiceReadyEncoder.BLOCK_LENGTH;
-
-        int attempts = SEND_ATTEMPTS;
-        do
-        {
-            if (consensusModulePublication.tryClaim(length, bufferClaim) > 0)
-            {
-                encoder
-                    .wrapAndApplyHeader(bufferClaim.buffer(), bufferClaim.offset(), messageHeaderEncoder)
-                    .serviceId(serviceId);
-
-                bufferClaim.commit();
-
-                return;
-            }
-
-            Thread.yield();
-        }
-        while (--attempts > 0);
-
-        throw new IllegalStateException("Failed to notify snapshot taken");
-    }
-
-    private void takeSnapshot()
-    {
-        final long recordingId;
-
-        try (AeronArchive aeronArchive = AeronArchive.connect(archiveCtx))
-        {
-            final long correlationId = aeronArchive.startRecording(
-                ctx.snapshotChannel(), ctx.snapshotStreamId(), SourceLocation.LOCAL);
-
-            try (Publication publication = aeron.addExclusivePublication(
-                ctx.snapshotChannel(), ctx.snapshotStreamId()))
-            {
-                while (!publication.isConnected())
-                {
-                    Thread.yield();
-                }
-
-                recordingId = RecordingPos.findActiveRecordingId(
-                    aeron.countersReader(), aeronArchive.controlSessionId(), correlationId, publication.sessionId());
-
-                service.onTakeSnapshot(publication);
-            }
-
-            aeronArchive.stopRecording(ctx.snapshotChannel(), ctx.snapshotStreamId());
-        }
-
-        recordingIndex.appendLog(recordingId, logPosition(), messageIndex);
-        notifySnapshotTaken();
-    }
-
-    private void loadSnapshot(
-        final IdleStrategy idleStrategy, final AeronArchive aeronArchive, final RecordingInfo recordingInfo)
-    {
-        if (null == recordingInfo)
-        {
-            throw new IllegalStateException("could not find snapshot recording");
-        }
-
         try (Subscription replaySubscription = aeronArchive.replay(
             recordingInfo.recordingId,
             recordingInfo.startPosition,
@@ -525,8 +465,10 @@ public class ClusteredServiceAgent implements
             ctx.replayChannel(),
             ctx.replayStreamId()))
         {
+            idleStrategy.reset();
             while (!replaySubscription.isConnected())
             {
+                checkInterruptedStatus();
                 idleStrategy.idle();
             }
 
@@ -535,7 +477,283 @@ public class ClusteredServiceAgent implements
                 throw new IllegalStateException("Only expected one replay");
             }
 
-            service.onLoadSnapshot(replaySubscription.imageAtIndex(0));
+
+            final Image snapshotImage = replaySubscription.imageAtIndex(0);
+            loadState(snapshotImage);
+            service.onLoadSnapshot(snapshotImage);
+        }
+    }
+
+    private void onTakeSnapshot(final long position)
+    {
+        state = State.SNAPSHOTTING;
+        final long recordingId;
+
+        try (AeronArchive aeronArchive = AeronArchive.connect(archiveCtx))
+        {
+            aeronArchive.startRecording(ctx.snapshotChannel(), ctx.snapshotStreamId(), SourceLocation.LOCAL);
+
+            try (Publication publication = aeron.addExclusivePublication(ctx.snapshotChannel(), ctx.snapshotStreamId()))
+            {
+                idleStrategy.reset();
+                while (!publication.isConnected())
+                {
+                    checkInterruptedStatus();
+                    idleStrategy.idle();
+                }
+
+                snapshotState(publication);
+                service.onTakeSnapshot(publication);
+
+                final CountersReader countersReader = aeron.countersReader();
+                final int recordingCounterId = RecordingPos.findActiveRecordingCounterIdBySession(
+                    countersReader, publication.sessionId());
+
+                recordingId = RecordingPos.getActiveRecordingId(countersReader, recordingCounterId);
+
+                while (countersReader.getCounterValue(recordingCounterId) < publication.position())
+                {
+                    checkInterruptedStatus();
+                    Thread.yield();
+                }
+            }
+            finally
+            {
+                aeronArchive.stopRecording(ctx.snapshotChannel(), ctx.snapshotStreamId());
+            }
+        }
+        finally
+        {
+            state = State.LEADING;
+        }
+
+        recordingIndex.appendLog(recordingId, position, messageIndex);
+    }
+
+    private void snapshotState(final Publication publication)
+    {
+        markSnapshot(publication, SnapshotMark.BEGIN);
+
+        for (final ClientSession clientSession : sessionByIdMap.values())
+        {
+            final String responseChannel = clientSession.responsePublication().channel();
+            final int responseStreamId = clientSession.responsePublication().streamId();
+            final int length = MessageHeaderEncoder.ENCODED_LENGTH + ClientSessionEncoder.BLOCK_LENGTH +
+                ClientSessionEncoder.responseChannelHeaderLength() + responseChannel.length();
+
+            idleStrategy.reset();
+            while (true)
+            {
+                final long result = publication.tryClaim(length, bufferClaim);
+                if (result > 0)
+                {
+                    clientSessionEncoder
+                        .wrapAndApplyHeader(bufferClaim.buffer(), bufferClaim.offset(), messageHeaderEncoder)
+                        .clusterSessionId(clientSession.id())
+                        .responseStreamId(responseStreamId)
+                        .responseChannel(responseChannel);
+
+                    bufferClaim.commit();
+                    break;
+                }
+
+                checkResult(result);
+                checkInterruptedStatus();
+                idleStrategy.idle();
+            }
+        }
+
+        markSnapshot(publication, SnapshotMark.END);
+    }
+
+    private void loadState(final Image image)
+    {
+        final MutableBoolean inSnapshot = new MutableBoolean(false);
+        final MutableBoolean isDone = new MutableBoolean(false);
+        final SnapshotMarkerDecoder snapshotMarkerDecoder = new SnapshotMarkerDecoder();
+        final ClientSessionDecoder clientSessionDecoder = new ClientSessionDecoder();
+
+        while (true)
+        {
+            final int fragmentsRead = image.controlledPoll(
+                (buffer, offset, length, header) ->
+                {
+                    messageHeaderDecoder.wrap(buffer, offset);
+
+                    final int templateId = messageHeaderDecoder.templateId();
+                    switch (templateId)
+                    {
+                        case SnapshotMarkerDecoder.TEMPLATE_ID:
+                            snapshotMarkerDecoder.wrap(
+                                buffer,
+                                offset,
+                                messageHeaderDecoder.blockLength(),
+                                messageHeaderDecoder.version());
+
+                            final long typeId = snapshotMarkerDecoder.typeId();
+                            if (typeId != SNAPSHOT_TYPE_ID)
+                            {
+                                throw new IllegalStateException("Unexpected snapshot type: " + typeId);
+                            }
+
+                            final SnapshotMark mark = snapshotMarkerDecoder.mark();
+                            if (!inSnapshot.get() && mark == SnapshotMark.BEGIN)
+                            {
+                                inSnapshot.set(true);
+                                return Action.BREAK;
+                            }
+                            else if (inSnapshot.get() && mark == SnapshotMark.END)
+                            {
+                                isDone.set(true);
+                            }
+                            else
+                            {
+                                throw new IllegalStateException("inSnapshot=" + inSnapshot + " mark=" + mark);
+                            }
+                            break;
+
+                        case ClientSessionDecoder.TEMPLATE_ID:
+                            clientSessionDecoder.wrap(
+                                buffer,
+                                offset,
+                                messageHeaderDecoder.blockLength(),
+                                messageHeaderDecoder.version());
+
+                            final long sessionId = clientSessionDecoder.clusterSessionId();
+                            sessionByIdMap.put(
+                                sessionId,
+                                new ClientSession(
+                                    sessionId,
+                                    aeron.addExclusivePublication(
+                                        clientSessionDecoder.responseChannel(),
+                                        clientSessionDecoder.responseStreamId()),
+                                    ClusteredServiceAgent.this));
+                            break;
+
+                        default:
+                            throw new IllegalStateException("Unknown template id: " + templateId);
+                    }
+
+                    return Action.CONTINUE;
+                },
+                FRAGMENT_LIMIT
+            );
+
+            if (isDone.get())
+            {
+                break;
+            }
+
+            if (0 == fragmentsRead)
+            {
+                checkInterruptedStatus();
+                idleStrategy.idle();
+            }
+            else
+            {
+                idleStrategy.reset();
+            }
+        }
+    }
+
+    private void markSnapshot(final Publication publication, final SnapshotMark snapshotMark)
+    {
+        idleStrategy.reset();
+        while (true)
+        {
+            final int length = MessageHeaderEncoder.ENCODED_LENGTH + SnapshotMarkerEncoder.BLOCK_LENGTH;
+            final long result = publication.tryClaim(length, bufferClaim);
+            if (result > 0)
+            {
+                new SnapshotMarkerEncoder()
+                    .wrapAndApplyHeader(bufferClaim.buffer(), bufferClaim.offset(), messageHeaderEncoder)
+                    .typeId(SNAPSHOT_TYPE_ID)
+                    .index(0)
+                    .mark(snapshotMark);
+
+                bufferClaim.commit();
+                break;
+            }
+
+            checkResult(result);
+            checkInterruptedStatus();
+            idleStrategy.idle();
+        }
+    }
+
+    private void sendAcknowledgment(final ServiceAction action, final long logPosition)
+    {
+        final int length = MessageHeaderEncoder.ENCODED_LENGTH + ServiceActionAckEncoder.BLOCK_LENGTH;
+
+        idleStrategy.reset();
+        int attempts = SEND_ATTEMPTS;
+        do
+        {
+            if (consensusModulePublication.tryClaim(length, bufferClaim) > 0)
+            {
+                serviceActionAckEncoder
+                    .wrapAndApplyHeader(bufferClaim.buffer(), bufferClaim.offset(), messageHeaderEncoder)
+                    .serviceId(serviceId)
+                    .logPosition(logPosition)
+                    .messageIndex(messageIndex)
+                    .action(action);
+
+                bufferClaim.commit();
+
+                return;
+            }
+
+            idleStrategy.idle();
+        }
+        while (--attempts > 0);
+
+        throw new IllegalStateException("Failed to send ACK");
+    }
+
+    private void executeAction(final ServiceAction action, final long position)
+    {
+        if (State.RECOVERING == state)
+        {
+            return;
+        }
+
+        switch (action)
+        {
+            case SNAPSHOT:
+                onTakeSnapshot(position);
+                sendAcknowledgment(ServiceAction.SNAPSHOT, position);
+                break;
+
+            case SHUTDOWN:
+                onTakeSnapshot(position);
+                sendAcknowledgment(ServiceAction.SHUTDOWN, position);
+                state = State.CLOSED;
+                ctx.shutdownSignalBarrier().signal();
+                break;
+
+            case ABORT:
+                sendAcknowledgment(ServiceAction.ABORT, position);
+                state = State.CLOSED;
+                ctx.shutdownSignalBarrier().signal();
+                break;
+        }
+    }
+
+    private void checkInterruptedStatus()
+    {
+        if (Thread.currentThread().isInterrupted())
+        {
+            throw new AgentTerminationException("Unexpected interrupt during operation");
+        }
+    }
+
+    private static void checkResult(final long result)
+    {
+        if (result == Publication.NOT_CONNECTED ||
+            result == Publication.CLOSED ||
+            result == Publication.MAX_POSITION_EXCEEDED)
+        {
+            throw new IllegalStateException("Unexpected publication state: " + result);
         }
     }
 }

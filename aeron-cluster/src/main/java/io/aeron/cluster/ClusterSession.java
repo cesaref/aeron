@@ -22,7 +22,7 @@ class ClusterSession implements AutoCloseable
 {
     enum State
     {
-        INIT, CONNECTED, OPEN, TIMED_OUT, CLOSED
+        INIT, CONNECTED, CHALLENGED, AUTHENTICATED, REJECTED, OPEN, TIMED_OUT, CLOSED
     }
 
     private long timeOfLastActivityMs;
@@ -82,11 +82,6 @@ class ClusterSession implements AutoCloseable
     long lastCorrelationId()
     {
         return lastCorrelationId;
-    }
-
-    void lastCorrelationId(final long correlationId)
-    {
-        lastCorrelationId = correlationId;
     }
 
     public String toString()

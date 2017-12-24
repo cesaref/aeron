@@ -31,7 +31,7 @@ class LogAppender implements AutoCloseable
     private final SessionOpenEventEncoder connectEventEncoder = new SessionOpenEventEncoder();
     private final SessionCloseEventEncoder closeEventEncoder = new SessionCloseEventEncoder();
     private final TimerEventEncoder timerEventEncoder = new TimerEventEncoder();
-    private final SnapshotRequestEncoder snapshotRequestEncoder = new SnapshotRequestEncoder();
+    private final ServiceActionRequestEncoder actionRequestEncoder = new ServiceActionRequestEncoder();
     private final BufferClaim bufferClaim = new BufferClaim();
     private final Publication publication;
 
@@ -43,6 +43,11 @@ class LogAppender implements AutoCloseable
     public void close()
     {
         CloseHelper.close(publication);
+    }
+
+    public long position()
+    {
+        return publication.position();
     }
 
     public boolean appendMessage(final DirectBuffer buffer, final int offset, final int length, final long nowMs)
@@ -144,17 +149,22 @@ class LogAppender implements AutoCloseable
         return false;
     }
 
-    public boolean appendSnapshotRequest()
+    public boolean appendActionRequest(
+        final ServiceAction action, final long nowMs, final long logPosition, final long messageIndex)
     {
-        final int length = MessageHeaderEncoder.ENCODED_LENGTH + SnapshotRequestEncoder.BLOCK_LENGTH;
+        final int length = MessageHeaderEncoder.ENCODED_LENGTH + ServiceActionRequestEncoder.BLOCK_LENGTH;
 
         int attempts = SEND_ATTEMPTS;
         do
         {
             if (publication.tryClaim(length, bufferClaim) > 0)
             {
-                snapshotRequestEncoder.wrapAndApplyHeader(
-                    bufferClaim.buffer(), bufferClaim.offset(), messageHeaderEncoder);
+                actionRequestEncoder.wrapAndApplyHeader(
+                    bufferClaim.buffer(), bufferClaim.offset(), messageHeaderEncoder)
+                    .logPosition(logPosition)
+                    .messageIndex(messageIndex)
+                    .timestamp(nowMs)
+                    .action(action);
 
                 bufferClaim.commit();
 

@@ -133,9 +133,7 @@ public class RecordingPos
      * @param recordingId    for the active recording.
      * @return the counter id if found otherwise {@link #NULL_COUNTER_ID}.
      */
-    public static int findActiveRecordingPositionCounterId(
-        final CountersReader countersReader,
-        final long recordingId)
+    public static int findActiveRecordingCounterId(final CountersReader countersReader, final long recordingId)
     {
         final DirectBuffer buffer = countersReader.metaDataBuffer();
 
@@ -154,5 +152,57 @@ public class RecordingPos
         }
 
         return NULL_COUNTER_ID;
+    }
+
+    /**
+     * Find the active counter id for a stream based on the session id.
+     *
+     * @param countersReader to search within.
+     * @param sessionId      for the active recording.
+     * @return the counter id if found otherwise {@link #NULL_COUNTER_ID}.
+     */
+    public static int findActiveRecordingCounterIdBySession(final CountersReader countersReader, final int sessionId)
+    {
+        final DirectBuffer buffer = countersReader.metaDataBuffer();
+
+        for (int i = 0, size = countersReader.maxCounterId(); i < size; i++)
+        {
+            if (countersReader.getCounterState(i) == RECORD_ALLOCATED)
+            {
+                final int recordOffset = CountersReader.metaDataOffset(i);
+
+                if (buffer.getInt(recordOffset + TYPE_ID_OFFSET) == RECORDING_POSITION_TYPE_ID &&
+                    buffer.getInt(recordOffset + KEY_OFFSET + SESSION_ID_OFFSET) == sessionId)
+                {
+                    return i;
+                }
+            }
+        }
+
+        return NULL_COUNTER_ID;
+    }
+
+    /**
+     * Get the active recording id for a given counter id.
+     *
+     * @param countersReader to search within.
+     * @param counterId      for the active recording.
+     * @return the counter id if found otherwise {@link #NULL_COUNTER_ID}.
+     */
+    public static long getActiveRecordingId(final CountersReader countersReader, final int counterId)
+    {
+        final DirectBuffer buffer = countersReader.metaDataBuffer();
+
+        if (countersReader.getCounterState(counterId) == RECORD_ALLOCATED)
+        {
+            final int recordOffset = CountersReader.metaDataOffset(counterId);
+
+            if (buffer.getInt(recordOffset + TYPE_ID_OFFSET) == RECORDING_POSITION_TYPE_ID)
+            {
+                return buffer.getLong(recordOffset + KEY_OFFSET + RECORDING_ID_OFFSET);
+            }
+        }
+
+        return NULL_RECORDING_ID;
     }
 }

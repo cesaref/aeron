@@ -22,15 +22,17 @@ import io.aeron.archive.codecs.SourceLocation;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.control.ClusterControl;
 import io.aeron.cluster.service.ClusteredServiceContainer;
-import org.agrona.CloseHelper;
-import org.agrona.ErrorHandler;
+import io.aeron.cluster.service.RecordingIndex;
+import org.agrona.*;
 import org.agrona.concurrent.*;
 import org.agrona.concurrent.status.AtomicCounter;
 
+import java.io.File;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
+import static io.aeron.cluster.ConsensusModule.Configuration.CONSENSUS_MODULE_STATE_TYPE_ID;
 import static io.aeron.cluster.control.ClusterControl.CONTROL_TOGGLE_TYPE_ID;
 import static io.aeron.driver.status.SystemCounterDescriptor.SYSTEM_COUNTER_TYPE_ID;
 import static org.agrona.SystemUtil.getDurationInNanos;
@@ -42,6 +44,56 @@ public class ConsensusModule implements
     ClusterSessionSupplier,
     ConsensusModuleAdapterSupplier
 {
+    /**
+     * Possible states for the consensus module. These will be reflected in the {@link Context#moduleState()} counter.
+     */
+    public enum State
+    {
+        INIT(0), ACTIVE(1), SUSPENDED(2), SNAPSHOT(3), SHUTDOWN(4), ABORT(5), CLOSED(6);
+
+        private final int code;
+
+        static final State[] STATES;
+        static
+        {
+            final State[] states = values();
+            STATES = new State[states.length];
+            for (final State state : states)
+            {
+                STATES[state.code()] = state;
+            }
+        }
+
+        State(final int code)
+        {
+            this.code = code;
+        }
+
+        public final int code()
+        {
+            return code;
+        }
+
+        /**
+         * Get the {@link State} encoded in an {@link AtomicCounter}.
+         *
+         * @param counter to get the current state for.
+         * @return the state for the {@link ConsensusModule}.
+         * @throws IllegalStateException if the counter is not one of the valid values.
+         */
+        public static State get(final AtomicCounter counter)
+        {
+            final long value = counter.get();
+
+            if (value < 0 || value > (STATES.length - 1))
+            {
+                throw new IllegalStateException("Invalid state counter value: " + value);
+            }
+
+            return STATES[(int)value];
+        }
+    }
+
     private static final int FRAGMENT_POLL_LIMIT = 10;
     private static final int TIMER_POLL_LIMIT = 10;
 
@@ -62,7 +114,13 @@ public class ConsensusModule implements
         logAppender = new LogAppender(ctx.aeron().addExclusivePublication(ctx.logChannel(), ctx.logStreamId()));
 
         final SequencerAgent conductor = new SequencerAgent(
-            ctx, new EgressPublisher(), logAppender, this, this, this, this);
+            ctx,
+            new EgressPublisher(),
+            logAppender,
+            this,
+            this,
+            this,
+            this);
 
         conductorRunner = new AgentRunner(ctx.idleStrategy(), ctx.errorHandler(), ctx.errorCounter(), conductor);
     }
@@ -87,7 +145,7 @@ public class ConsensusModule implements
      * Launch an {@link ConsensusModule} by providing a configuration context.
      *
      * @param ctx for the configuration parameters.
-     * @return  a new instance of an {@link ConsensusModule}.
+     * @return a new instance of an {@link ConsensusModule}.
      */
     public static ConsensusModule launch(final Context ctx)
     {
@@ -127,7 +185,8 @@ public class ConsensusModule implements
     public ClusterSession newClusterSession(
         final long sessionId, final int responseStreamId, final String responseChannel)
     {
-        return new ClusterSession(sessionId, ctx.aeron().addPublication(responseChannel, responseStreamId));
+        return new ClusterSession(
+            sessionId, ctx.aeron().addPublication(responseChannel, responseStreamId));
     }
 
     public ConsensusModuleAdapter newConsensusModuleAdapter(final SequencerAgent sequencerAgent)
@@ -143,6 +202,36 @@ public class ConsensusModule implements
      */
     public static class Configuration
     {
+        /**
+         * Message detail to be sent when max concurrent session limit is reached.
+         */
+        public static final String SESSION_LIMIT_MSG = "Concurrent session limit";
+
+        /**
+         * Message detail to be sent when a session timeout occurs.
+         */
+        public static final String SESSION_TIMEOUT_MSG = "Session inactive";
+
+        /**
+         * Message detail to be sent when a session is rejected due to authentication.
+         */
+        public static final String SESSION_REJECTED_MSG = "Session failed authentication";
+
+        /**
+         * Counter type id for the consensus module state.
+         */
+        public static final int CONSENSUS_MODULE_STATE_TYPE_ID = 200;
+
+        /**
+         * Directory to use for the aeron cluster.
+         */
+        public static final String CLUSTER_DIR_PROP_NAME = "aeron.cluster.dir";
+
+        /**
+         * Directory to use for the aeron cluster.
+         */
+        public static final String CLUSTER_DIR_DEFAULT = "aeron-cluster";
+
         /**
          * The number of services in this cluster instance.
          */
@@ -172,6 +261,27 @@ public class ConsensusModule implements
          * Timeout for a session if no activity is observed. Default to 5 seconds in nanoseconds.
          */
         public static final long SESSION_TIMEOUT_DEFAULT_NS = TimeUnit.SECONDS.toNanos(5);
+
+        /**
+         * Name of class to use as a supplier of {@link Authenticator} for the cluster.
+         */
+        public static final String AUTHENTICATOR_SUPPLIER_PROP_NAME = "aeron.cluster.Authenticator.supplier";
+
+        /**
+         * Name of the class to use as a supplier of {@link Authenticator} for the cluster. Default is
+         * a non-authenticating option.
+         */
+        public static final String AUTHENTICATOR_SUPPLIER_DEFAULT = "io.aeron.cluster.DefaultAuthenticatorSupplier";
+
+        /**
+         * The value {@link #CLUSTER_DIR_DEFAULT} or system property {@link #CLUSTER_DIR_PROP_NAME} if set.
+         *
+         * @return {@link #CLUSTER_DIR_DEFAULT} or system property {@link #CLUSTER_DIR_PROP_NAME} if set.
+         */
+        public static String clusterDirName()
+        {
+            return System.getProperty(CLUSTER_DIR_PROP_NAME, CLUSTER_DIR_DEFAULT);
+        }
 
         /**
          * The value {@link #SERVICE_COUNT_DEFAULT} or system property
@@ -207,12 +317,41 @@ public class ConsensusModule implements
         {
             return getDurationInNanos(SESSION_TIMEOUT_PROP_NAME, SESSION_TIMEOUT_DEFAULT_NS);
         }
+
+        /**
+         * The value {@link #AUTHENTICATOR_SUPPLIER_DEFAULT} or system property
+         * {@link #AUTHENTICATOR_SUPPLIER_PROP_NAME} if set.
+         *
+         * @return {@link #AUTHENTICATOR_SUPPLIER_DEFAULT} or system property
+         * {@link #AUTHENTICATOR_SUPPLIER_PROP_NAME} if set.
+         */
+        public static AuthenticatorSupplier authenticatorSupplier()
+        {
+            final String supplierClassName =
+                System.getProperty(AUTHENTICATOR_SUPPLIER_PROP_NAME, AUTHENTICATOR_SUPPLIER_DEFAULT);
+            AuthenticatorSupplier supplier = null;
+
+            try
+            {
+                supplier = (AuthenticatorSupplier)Class.forName(supplierClassName).newInstance();
+            }
+            catch (final Exception ex)
+            {
+                LangUtil.rethrowUnchecked(ex);
+            }
+
+            return supplier;
+        }
     }
 
     public static class Context implements AutoCloseable
     {
         private boolean ownsAeronClient = false;
         private Aeron aeron;
+
+        private boolean deleteDirOnStart = false;
+        private File clusterDir;
+        private RecordingIndex recordingIndex;
 
         private String ingressChannel = AeronCluster.Configuration.ingressChannel();
         private int ingressStreamId = AeronCluster.Configuration.ingressStreamId();
@@ -235,12 +374,44 @@ public class ConsensusModule implements
         private CountedErrorHandler countedErrorHandler;
 
         private Counter messageIndex;
+        private Counter moduleState;
         private Counter controlToggle;
+        private ShutdownSignalBarrier shutdownSignalBarrier;
 
         private AeronArchive.Context archiveContext;
+        private AuthenticatorSupplier authenticatorSupplier;
 
+        @SuppressWarnings("MethodLength")
         public void conclude()
         {
+            if (deleteDirOnStart)
+            {
+                if (null != clusterDir)
+                {
+                    IoUtil.delete(clusterDir, true);
+                }
+                else
+                {
+                    IoUtil.delete(new File(Configuration.clusterDirName()), true);
+                }
+            }
+
+            if (null == clusterDir)
+            {
+                clusterDir = new File(Configuration.clusterDirName());
+            }
+
+            if (!clusterDir.exists() && !clusterDir.mkdirs())
+            {
+                throw new IllegalStateException(
+                    "Failed to create cluster dir: " + clusterDir.getAbsolutePath());
+            }
+
+            if (null == recordingIndex)
+            {
+                recordingIndex = new RecordingIndex(clusterDir);
+            }
+
             if (null == errorHandler)
             {
                 throw new IllegalStateException("Error handler must be supplied");
@@ -292,6 +463,11 @@ public class ConsensusModule implements
                 messageIndex = aeron.addCounter(SYSTEM_COUNTER_TYPE_ID, "Log message index");
             }
 
+            if (null == moduleState)
+            {
+                moduleState = aeron.addCounter(CONSENSUS_MODULE_STATE_TYPE_ID, "Consensus Module state");
+            }
+
             if (null == controlToggle)
             {
                 controlToggle = aeron.addCounter(CONTROL_TOGGLE_TYPE_ID, "Control toggle");
@@ -311,6 +487,84 @@ public class ConsensusModule implements
             {
                 archiveContext = new AeronArchive.Context().lock(new NoOpLock());
             }
+
+            if (null == shutdownSignalBarrier)
+            {
+                shutdownSignalBarrier = new ShutdownSignalBarrier();
+            }
+
+            if (null == authenticatorSupplier)
+            {
+                authenticatorSupplier = Configuration.authenticatorSupplier();
+            }
+        }
+
+        /**
+         * Should the consensus module attempt to immediately delete {@link #clusterDir()} on startup.
+         *
+         * @param deleteDirOnStart Attempt deletion.
+         * @return this for a fluent API.
+         */
+        public Context deleteDirOnStart(final boolean deleteDirOnStart)
+        {
+            this.deleteDirOnStart = deleteDirOnStart;
+            return this;
+        }
+
+        /**
+         * Will the consensus module attempt to immediately delete {@link #clusterDir()} on startup.
+         *
+         * @return true when directory will be deleted, otherwise false.
+         */
+        public boolean deleteDirOnStart()
+        {
+            return deleteDirOnStart;
+        }
+
+        /**
+         * Set the directory to use for the clustered service container.
+         *
+         * @param clusterDir to use.
+         * @return this for a fluent API.
+         * @see Configuration#CLUSTER_DIR_PROP_NAME
+         */
+        public Context clusterDir(final File clusterDir)
+        {
+            this.clusterDir = clusterDir;
+            return this;
+        }
+
+        /**
+         * The directory used for the clustered service container.
+         *
+         * @return directory for the cluster container.
+         * @see Configuration#CLUSTER_DIR_PROP_NAME
+         */
+        public File clusterDir()
+        {
+            return clusterDir;
+        }
+
+        /**
+         * Set the {@link RecordingIndex} for the log terms and snapshots.
+         *
+         * @param recordingIndex to use.
+         * @return this for a fluent API.
+         */
+        public Context recordingIndex(final RecordingIndex recordingIndex)
+        {
+            this.recordingIndex = recordingIndex;
+            return this;
+        }
+
+        /**
+         * The {@link RecordingIndex} for the log terms and snapshots.
+         *
+         * @return {@link RecordingIndex} for the  log terms and snapshots.
+         */
+        public RecordingIndex recordingIndex()
+        {
+            return recordingIndex;
         }
 
         /**
@@ -706,6 +960,30 @@ public class ConsensusModule implements
         }
 
         /**
+         * Get the counter for the current state of the consensus module.
+         *
+         * @return the counter for the current state of the consensus module.
+         * @see State
+         */
+        public Counter moduleState()
+        {
+            return moduleState;
+        }
+
+        /**
+         * Set the counter for the current state of the consensus module.
+         *
+         * @param moduleState the counter for the current state of the consensus module.t
+         * @return this for a fluent API.
+         * @see State
+         */
+        public Context moduleState(final Counter moduleState)
+        {
+            this.moduleState = moduleState;
+            return this;
+        }
+
+        /**
          * Get the counter for the control toggle for triggering actions on the cluster node.
          *
          * @return the counter for triggering cluster node actions.
@@ -803,6 +1081,61 @@ public class ConsensusModule implements
         }
 
         /**
+         * Get the {@link AuthenticatorSupplier} that should be used for the consensus module.
+         *
+         * @return the {@link AuthenticatorSupplier} to be used for the consensus module.
+         */
+        public AuthenticatorSupplier authenticatorSupplier()
+        {
+            return authenticatorSupplier;
+        }
+
+        /**
+         * Set the {@link AuthenticatorSupplier} that will be used for the consensus module.
+         *
+         * @param authenticatorSupplier {@link AuthenticatorSupplier} to use for the consensus module.
+         * @return this for a fluent API.
+         */
+        public Context authenticatorSupplier(final AuthenticatorSupplier authenticatorSupplier)
+        {
+            this.authenticatorSupplier = authenticatorSupplier;
+            return this;
+        }
+
+        /**
+         * Set the {@link ShutdownSignalBarrier} that can be used to shutdown a consensus module.
+         *
+         * @param barrier that can be used to shutdown a consensus module.
+         * @return this for a fluent API.
+         */
+        public Context shutdownSignalBarrier(final ShutdownSignalBarrier barrier)
+        {
+            shutdownSignalBarrier = barrier;
+            return this;
+        }
+
+        /**
+         * Get the {@link ShutdownSignalBarrier} that can be used to shutdown a consensus module.
+         *
+         * @return the {@link ShutdownSignalBarrier} that can be used to shutdown a consensus module.
+         */
+        public ShutdownSignalBarrier shutdownSignalBarrier()
+        {
+            return shutdownSignalBarrier;
+        }
+
+        /**
+         * Delete the cluster directory.
+         */
+        public void deleteDirectory()
+        {
+            if (null != clusterDir)
+            {
+                IoUtil.delete(clusterDir, false);
+            }
+        }
+
+        /**
          * Close the context and free applicable resources.
          * <p>
          * If {@link #ownsAeronClient()} is true then the {@link #aeron()} client will be closed.
@@ -816,6 +1149,7 @@ public class ConsensusModule implements
             else
             {
                 CloseHelper.close(messageIndex);
+                CloseHelper.close(moduleState);
                 CloseHelper.close(controlToggle);
             }
         }

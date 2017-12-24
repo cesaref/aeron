@@ -17,15 +17,18 @@ package io.aeron.cluster;
 
 import io.aeron.Aeron;
 import io.aeron.Counter;
+import io.aeron.Publication;
 import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.codecs.EventCode;
+import io.aeron.cluster.codecs.ServiceAction;
+import org.agrona.collections.MutableLong;
 import org.agrona.concurrent.CachedEpochClock;
 import org.agrona.concurrent.SystemEpochClock;
 import org.agrona.concurrent.status.AtomicCounter;
 import org.junit.Before;
 import org.junit.Test;
 
-import static io.aeron.cluster.control.ClusterControl.Action.*;
+import static io.aeron.cluster.control.ClusterControl.ToggleState.*;
 import static org.hamcrest.core.Is.is;
 import static org.junit.Assert.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -40,21 +43,25 @@ public class SequencerAgentTest
 
     private final EgressPublisher mockEgressPublisher = mock(EgressPublisher.class);
     private final LogAppender mockLogAppender = mock(LogAppender.class);
+    private final Publication mockResponsePublication = mock(Publication.class);
 
     private final ConsensusModule.Context ctx = new ConsensusModule.Context()
         .errorCounter(mock(AtomicCounter.class))
         .errorHandler(Throwable::printStackTrace)
         .messageIndex(mock(Counter.class))
+        .moduleState(mock(Counter.class))
         .controlToggle(mock(Counter.class))
         .aeron(mock(Aeron.class))
         .epochClock(new SystemEpochClock())
-        .cachedEpochClock(new CachedEpochClock());
+        .cachedEpochClock(new CachedEpochClock())
+        .authenticatorSupplier(new DefaultAuthenticatorSupplier());
 
     @Before
     public void before()
     {
         when(mockEgressPublisher.sendEvent(any(), any(), any())).thenReturn(Boolean.TRUE);
         when(mockLogAppender.appendConnectedSession(any(), anyLong())).thenReturn(Boolean.TRUE);
+        when(mockResponsePublication.isConnected()).thenReturn(true);
     }
 
     @Test
@@ -65,20 +72,19 @@ public class SequencerAgentTest
         final SequencerAgent agent = newSequencerAgent();
 
         final long correlationIdOne = 1L;
-        agent.onServiceReady(0L);
-        agent.onSessionConnect(correlationIdOne, 2, RESPONSE_CHANNEL_ONE);
+        agent.onActionAck(0, 0, 0, ServiceAction.READY);
+        agent.onSessionConnect(correlationIdOne, 2, RESPONSE_CHANNEL_ONE, new byte[0]);
         agent.doWork();
 
         verify(mockLogAppender).appendConnectedSession(any(ClusterSession.class), anyLong());
         verify(mockEgressPublisher).sendEvent(any(ClusterSession.class), eq(EventCode.OK), eq(""));
 
         final long correlationIdTwo = 2L;
-        agent.onSessionConnect(correlationIdTwo, 3, RESPONSE_CHANNEL_TWO);
+        agent.onSessionConnect(correlationIdTwo, 3, RESPONSE_CHANNEL_TWO, new byte[0]);
         agent.doWork();
 
-        verifyNoMoreInteractions(mockLogAppender);
-        verify(mockEgressPublisher)
-            .sendEvent(any(ClusterSession.class), eq(EventCode.ERROR), eq(SequencerAgent.SESSION_LIMIT_MSG));
+        verify(mockEgressPublisher).sendEvent(
+            any(ClusterSession.class), eq(EventCode.ERROR), eq(ConsensusModule.Configuration.SESSION_LIMIT_MSG));
     }
 
     @Test
@@ -93,9 +99,9 @@ public class SequencerAgentTest
         final SequencerAgent agent = newSequencerAgent();
 
         final long correlationId = 1L;
-        agent.onServiceReady(0L);
+        agent.onActionAck(0, 0, 0, ServiceAction.READY);
 
-        agent.onSessionConnect(correlationId, 2, RESPONSE_CHANNEL_ONE);
+        agent.onSessionConnect(correlationId, 2, RESPONSE_CHANNEL_ONE, new byte[0]);
         agent.doWork();
 
         verify(mockLogAppender).appendConnectedSession(any(ClusterSession.class), eq(startMs));
@@ -104,57 +110,80 @@ public class SequencerAgentTest
         clock.update(timeMs);
         agent.doWork();
 
-        verifyZeroInteractions(mockLogAppender);
-
         final long timeoutMs = timeMs + 1L;
         clock.update(timeoutMs);
         agent.doWork();
 
         verify(mockLogAppender).appendClosedSession(any(ClusterSession.class), eq(CloseReason.TIMEOUT), eq(timeoutMs));
-        verify(mockEgressPublisher)
-            .sendEvent(any(ClusterSession.class), eq(EventCode.ERROR), eq(SequencerAgent.SESSION_TIMEOUT_MSG));
+        verify(mockEgressPublisher).sendEvent(
+            any(ClusterSession.class), eq(EventCode.ERROR), eq(ConsensusModule.Configuration.SESSION_TIMEOUT_MSG));
     }
 
     @Test
-    public void shouldTransitionStates()
+    public void shouldSuspendThenResume()
     {
+        final MutableLong stateValue = new MutableLong();
+        final Counter mockState = mock(Counter.class);
+        when(mockState.get()).thenAnswer((invocation) -> stateValue.value);
+        doAnswer(
+            (invocation) ->
+            {
+                stateValue.value = invocation.getArgument(0);
+                return null;
+            })
+            .when(mockState).set(anyLong());
+
+        ctx.moduleState(mockState);
+
+        final MutableLong controlValue = new MutableLong(NEUTRAL.code());
         final Counter mockControlToggle = mock(Counter.class);
+        when(mockControlToggle.get()).thenAnswer((invocation) -> controlValue.value);
+        doAnswer(
+            (invocation) ->
+            {
+                controlValue.value = invocation.getArgument(0);
+                return null;
+            })
+            .when(mockControlToggle).set(anyLong());
+
         ctx.controlToggle(mockControlToggle);
 
-        when(mockControlToggle.get()).thenReturn(NEUTRAL.code());
-
         final SequencerAgent agent = newSequencerAgent();
-        assertThat(agent.state(), is(SequencerAgent.State.INIT));
+        assertThat((int)stateValue.get(), is(ConsensusModule.State.INIT.code()));
 
-        agent.onServiceReady(1L);
-        assertThat(agent.state(), is(SequencerAgent.State.ACTIVE));
+        agent.onActionAck(0, 0, 0, ServiceAction.READY);
+        assertThat((int)stateValue.get(), is(ConsensusModule.State.ACTIVE.code()));
 
-        when(mockControlToggle.get()).thenReturn(SUSPEND.code());
+        controlValue.value = SUSPEND.code();
         agent.doWork();
 
-        assertThat(agent.state(), is(SequencerAgent.State.SUSPENDED));
-        verify(mockControlToggle).set(NEUTRAL.code());
+        assertThat((int)stateValue.get(), is(ConsensusModule.State.SUSPENDED.code()));
+        assertThat((int)controlValue.get(), is(NEUTRAL.code()));
 
-        when(mockControlToggle.get()).thenReturn(RESUME.code());
+        controlValue.value = RESUME.code();
         agent.doWork();
 
-        assertThat(agent.state(), is(SequencerAgent.State.ACTIVE));
-        verify(mockControlToggle, times(2)).set(NEUTRAL.code());
+        assertThat((int)stateValue.get(), is(ConsensusModule.State.ACTIVE.code()));
+        assertThat((int)controlValue.get(), is(NEUTRAL.code()));
     }
 
     @Test
     public void shouldAppendSnapshotRequest()
     {
+        final MutableLong counterValue = new MutableLong(SNAPSHOT.code());
         final Counter mockControlToggle = mock(Counter.class);
+        when(mockControlToggle.get()).thenReturn(counterValue.value);
+
         ctx.controlToggle(mockControlToggle);
         final SequencerAgent agent = newSequencerAgent();
+        agent.onActionAck(0, 0, 0, ServiceAction.READY);
 
-        when(mockControlToggle.get()).thenReturn(SNAPSHOT.code());
-        when(mockLogAppender.appendSnapshotRequest()).thenReturn(Boolean.TRUE);
+        when(mockLogAppender.appendActionRequest(eq(ServiceAction.SNAPSHOT), anyLong(), anyLong(), anyLong()))
+            .thenReturn(Boolean.TRUE);
 
         agent.doWork();
 
-        verify(mockLogAppender).appendSnapshotRequest();
+        verify(mockLogAppender).appendActionRequest(eq(ServiceAction.SNAPSHOT), anyLong(), anyLong(), anyLong());
     }
 
     private SequencerAgent newSequencerAgent()
@@ -165,7 +194,7 @@ public class SequencerAgentTest
             mockLogAppender,
             (sequencerAgent) -> mock(IngressAdapter.class),
             (sequencerAgent) -> mock(TimerService.class),
-            (sessionId, responseStreamId, responseChannel) -> new ClusterSession(sessionId, null),
+            (sessionId, responseStreamId, responseChannel) -> new ClusterSession(sessionId, mockResponsePublication),
             (sequencerAgent) -> mock(ConsensusModuleAdapter.class));
     }
 }

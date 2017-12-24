@@ -33,53 +33,63 @@ import static org.agrona.concurrent.status.CountersReader.RECORD_ALLOCATED;
 import static org.agrona.concurrent.status.CountersReader.TYPE_ID_OFFSET;
 
 /**
- * Toggle control actions for a cluster node such as {@link Action#SUSPEND} or {@link Action#RESUME}.
+ * Toggle control {@link ToggleState}s for a cluster node such as {@link ToggleState#SUSPEND} or {@link ToggleState#RESUME}.
  */
 public class ClusterControl
 {
     /**
-     * Action request to the cluster.
+     * Toggle states for controlling the cluster node once it has entered the active state after initialising.
+     * The toggle can only we switched into a new state from {@link #NEUTRAL} and will be reset by the
+     * {@link io.aeron.cluster.ConsensusModule} once the triggered action is complete.
      */
-    public enum Action
+    public enum ToggleState
     {
         /**
          * Neutral state ready to accept a new action.
          */
-        NEUTRAL(0L),
+        NEUTRAL(0),
 
         /**
          * Suspend processing of ingress and timers.
          */
-        SUSPEND(1L),
+        SUSPEND(1),
 
         /**
          * Resume processing of ingress and timers.
          */
-        RESUME(2L),
+        RESUME(2),
 
         /**
          * Take a snapshot of cluster state.
          */
-        SNAPSHOT(3L);
-
-        private final long code;
-
-        Action(final long code)
-        {
-            this.code = code;
-        }
+        SNAPSHOT(3),
 
         /**
-         * Toggle the control counter to trigger the requested {@link Action}.
-         * <p>
-         * This action is thread safe and will only succeed if the toggle is in the {@link Action#NEUTRAL} state.
-         *
-         * @param controlToggle to change to the trigger state.
-         * @return true if the counter toggles or false if it is in a state other than {@link Action#NEUTRAL}.
+         * Shut down the cluster in an orderly fashion by taking a snapshot first.
          */
-        public boolean toggle(final AtomicCounter controlToggle)
+        SHUTDOWN(4),
+
+        /**
+         * Abort processing and shutdown the cluster without taking a snapshot.
+         */
+        ABORT(5);
+
+        private final int code;
+
+        static final ToggleState[] TOGGLE_STATES;
+        static
         {
-            return controlToggle.compareAndSet(NEUTRAL.code(), code());
+            final ToggleState[] toggleStates = values();
+            TOGGLE_STATES = new ToggleState[toggleStates.length];
+            for (final ToggleState toggleState : toggleStates)
+            {
+                TOGGLE_STATES[toggleState.code()] = toggleState;
+            }
+        }
+
+        ToggleState(final int code)
+        {
+            this.code = code;
         }
 
         /**
@@ -87,16 +97,58 @@ public class ClusterControl
          *
          * @return code to be used as the indicator in the control toggle counter.
          */
-        public long code()
+        public final int code()
         {
             return code;
+        }
+
+        /**
+         * Toggle the control counter to trigger the requested {@link ToggleState}.
+         * <p>
+         * This action is thread safe and will only succeed if the toggle is in the {@link ToggleState#NEUTRAL} state.
+         *
+         * @param controlToggle to change to the trigger state.
+         * @return true if the counter toggles or false if it is in a state other than {@link ToggleState#NEUTRAL}.
+         */
+        public final boolean toggle(final AtomicCounter controlToggle)
+        {
+            return controlToggle.compareAndSet(NEUTRAL.code(), code());
+        }
+
+        /**
+         * Reset the toggle to the {@link #NEUTRAL} state.
+         *
+         * @param controlToggle to be reset.
+         */
+        public static void reset(final AtomicCounter controlToggle)
+        {
+            controlToggle.set(NEUTRAL.code());
+        }
+
+        /**
+         * Get the {@link ToggleState} for a given control toggle.
+         *
+         * @param controlToggle to get the current state for.
+         * @return the state for the current control toggle.
+         * @throws IllegalStateException if the counter is not one of the valid values.
+         */
+        public static ToggleState get(final AtomicCounter controlToggle)
+        {
+            final long toggleValue = controlToggle.get();
+
+            if (toggleValue < 0 || toggleValue > (TOGGLE_STATES.length - 1))
+            {
+                throw new IllegalStateException("Invalid toggle value: " + toggleValue);
+            }
+
+            return TOGGLE_STATES[(int)toggleValue];
         }
     }
 
     /**
      * Counter type id for the control toggle.
      */
-    public static final int CONTROL_TOGGLE_TYPE_ID = 200;
+    public static final int CONTROL_TOGGLE_TYPE_ID = 201;
 
     /**
      * Map a {@link CountersReader} over the default location CnC file.
@@ -171,7 +223,7 @@ public class ClusterControl
     {
         checkUsage(args);
 
-        final Action action = Action.valueOf(args[0].toUpperCase());
+        final ToggleState toggleState = ToggleState.valueOf(args[0].toUpperCase());
 
         final File cncFile = CommonContext.newDefaultCncFile();
         System.out.println("Command `n Control file " + cncFile);
@@ -185,13 +237,13 @@ public class ClusterControl
             System.exit(0);
         }
 
-        if (action.toggle(controlToggle))
+        if (toggleState.toggle(controlToggle))
         {
-            System.out.println(action + " toggled successfully");
+            System.out.println(toggleState + " toggled successfully");
         }
         else
         {
-            System.out.println(action + " did NOT toggle");
+            System.out.println(toggleState + " did NOT toggle");
         }
     }
 

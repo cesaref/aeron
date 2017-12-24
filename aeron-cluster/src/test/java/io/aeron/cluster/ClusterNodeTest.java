@@ -33,7 +33,6 @@ import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.collections.MutableInteger;
 import org.agrona.concurrent.NoOpLock;
-import org.agrona.concurrent.status.AtomicCounter;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -41,7 +40,6 @@ import org.junit.Test;
 import static org.hamcrest.core.Is.is;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Mockito.mock;
 
 public class ClusterNodeTest
 {
@@ -57,12 +55,14 @@ public class ClusterNodeTest
             new MediaDriver.Context()
                 .threadingMode(ThreadingMode.SHARED)
                 .spiesSimulateConnection(true)
+                .termBufferSparseFile(true)
                 .errorHandler(Throwable::printStackTrace)
                 .dirDeleteOnStart(true),
             new Archive.Context()
                 .threadingMode(ArchiveThreadingMode.SHARED)
                 .deleteArchiveOnStart(true),
-            new ConsensusModule.Context());
+            new ConsensusModule.Context()
+                .deleteDirOnStart(true));
     }
 
     @After
@@ -71,12 +71,13 @@ public class ClusterNodeTest
         CloseHelper.close(container);
         CloseHelper.close(clusteredMediaDriver);
 
+        clusteredMediaDriver.consensusModule().context().deleteDirectory();
         clusteredMediaDriver.archive().context().deleteArchiveDirectory();
         clusteredMediaDriver.mediaDriver().context().deleteAeronDirectory();
 
         if (null != container)
         {
-            container.context().deleteClusterDirectory();
+            container.context().deleteDirectory();
         }
     }
 
@@ -149,6 +150,7 @@ public class ClusterNodeTest
     public void shouldScheduleEventInService()
     {
         container = launchScheduledService();
+
         final AeronCluster aeronCluster = connectToCluster();
         final Aeron aeron = aeronCluster.context().aeron();
 
@@ -223,7 +225,6 @@ public class ClusterNodeTest
         return ClusteredServiceContainer.launch(
             new ClusteredServiceContainer.Context()
                 .clusteredService(echoService)
-                .errorCounter(mock(AtomicCounter.class))
                 .errorHandler(Throwable::printStackTrace)
                 .deleteDirOnStart(true));
     }
@@ -269,7 +270,6 @@ public class ClusterNodeTest
         return ClusteredServiceContainer.launch(
             new ClusteredServiceContainer.Context()
                 .clusteredService(echoScheduledService)
-                .errorCounter(mock(AtomicCounter.class))
                 .errorHandler(Throwable::printStackTrace)
                 .deleteDirOnStart(true));
     }

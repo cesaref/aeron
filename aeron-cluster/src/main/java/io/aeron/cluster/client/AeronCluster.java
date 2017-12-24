@@ -19,6 +19,7 @@ import io.aeron.Aeron;
 import io.aeron.CommonContext;
 import io.aeron.Publication;
 import io.aeron.Subscription;
+import io.aeron.cluster.AuthenticationException;
 import io.aeron.cluster.codecs.*;
 import io.aeron.exceptions.TimeoutException;
 import io.aeron.logbuffer.BufferClaim;
@@ -264,40 +265,26 @@ public final class AeronCluster implements AutoCloseable
 
     private long connectToCluster()
     {
-        final long correlationId = aeron.nextCorrelationId();
+        final CredentialProvider credentialProvider = ctx.credentialProvider();
 
-        final int length = MessageHeaderEncoder.ENCODED_LENGTH +
-            SessionConnectRequestEncoder.BLOCK_LENGTH +
-            SessionConnectRequestEncoder.responseChannelHeaderLength() +
-            ctx.egressChannel().length();
+        final byte[] credentialData = credentialProvider.connectRequestCredentialData();
 
         final long deadlineNs = nanoClock.nanoTime() + ctx.messageTimeoutNs();
+
+        long correlationId = sendConnectRequest(credentialData, deadlineNs);
+
+        final EgressPoller poller = new EgressPoller(subscription, FRAGMENT_LIMIT);
+
         idleStrategy.reset();
-
-        while (true)
+        while (!poller.subscription().isConnected())
         {
-            if (publication.tryClaim(length, bufferClaim) > 0)
+            if (nanoClock.nanoTime() > deadlineNs)
             {
-                new SessionConnectRequestEncoder()
-                    .wrapAndApplyHeader(bufferClaim.buffer(), bufferClaim.offset(), messageHeaderEncoder)
-                    .correlationId(correlationId)
-                    .responseStreamId(ctx.egressStreamId())
-                    .responseChannel(ctx.egressChannel());
-
-                bufferClaim.commit();
-
-                break;
-            }
-            else if (nanoClock.nanoTime() > deadlineNs)
-            {
-                throw new TimeoutException("Failed to connect to cluster");
+                throw new TimeoutException("Failed to establish response connection");
             }
 
             idleStrategy.idle();
         }
-
-        final EgressPoller poller = new EgressPoller(subscription, FRAGMENT_LIMIT);
-        idleStrategy.reset();
 
         while (true)
         {
@@ -313,14 +300,101 @@ public final class AeronCluster implements AutoCloseable
 
             if (poller.correlationId() == correlationId)
             {
-                if (poller.eventCode() == EventCode.ERROR)
+                if (poller.challenged())
+                {
+                    final byte[] challengeResponseCredentialData =
+                        credentialProvider.onChallenge(poller.challengeData());
+
+                    correlationId =
+                        sendChallengeResponse(poller.clusterSessionId(), challengeResponseCredentialData, deadlineNs);
+                }
+                else if (poller.eventCode() == EventCode.ERROR)
                 {
                     throw new IllegalStateException(poller.detail());
                 }
-
-                return poller.clusterSessionId();
+                else if (poller.eventCode() == EventCode.AUTHENTICATION_REJECTED)
+                {
+                    throw new AuthenticationException(poller.detail());
+                }
+                else
+                {
+                    return poller.clusterSessionId();
+                }
             }
         }
+    }
+
+    private long sendConnectRequest(final byte[] credentialData, final long deadlineNs)
+    {
+        final long correlationId = aeron.nextCorrelationId();
+        final int length = MessageHeaderEncoder.ENCODED_LENGTH +
+            SessionConnectRequestEncoder.BLOCK_LENGTH +
+            SessionConnectRequestEncoder.responseChannelHeaderLength() +
+            ctx.egressChannel().length() +
+            SessionConnectRequestEncoder.credentialDataHeaderLength() +
+            credentialData.length;
+
+        idleStrategy.reset();
+
+        while (true)
+        {
+            if (publication.tryClaim(length, bufferClaim) > 0)
+            {
+                new SessionConnectRequestEncoder()
+                    .wrapAndApplyHeader(bufferClaim.buffer(), bufferClaim.offset(), messageHeaderEncoder)
+                    .correlationId(correlationId)
+                    .responseStreamId(ctx.egressStreamId())
+                    .responseChannel(ctx.egressChannel())
+                    .putCredentialData(credentialData, 0, credentialData.length);
+
+                bufferClaim.commit();
+
+                break;
+            }
+            else if (nanoClock.nanoTime() > deadlineNs)
+            {
+                throw new TimeoutException("Failed to connect to cluster");
+            }
+
+            idleStrategy.idle();
+        }
+
+        return correlationId;
+    }
+
+    private long sendChallengeResponse(final long sessionId, final byte[] credentialData, final long deadlineNs)
+    {
+        final long correlationId = aeron.nextCorrelationId();
+        final int length = MessageHeaderEncoder.ENCODED_LENGTH +
+            ChallengeResponseEncoder.BLOCK_LENGTH +
+            ChallengeResponseEncoder.credentialDataHeaderLength() +
+            credentialData.length;
+
+        idleStrategy.reset();
+
+        while (true)
+        {
+            if (publication.tryClaim(length, bufferClaim) > 0)
+            {
+                new ChallengeResponseEncoder()
+                    .wrapAndApplyHeader(bufferClaim.buffer(), bufferClaim.offset(), messageHeaderEncoder)
+                    .correlationId(correlationId)
+                    .clusterSessionId(sessionId)
+                    .putCredentialData(credentialData, 0, credentialData.length);
+
+                bufferClaim.commit();
+
+                break;
+            }
+            else if (nanoClock.nanoTime() > deadlineNs)
+            {
+                throw new TimeoutException("Failed to connect to cluster");
+            }
+
+            idleStrategy.idle();
+        }
+
+        return correlationId;
     }
 
     /**
@@ -452,6 +526,7 @@ public final class AeronCluster implements AutoCloseable
         private Lock lock;
         private String aeronDirectoryName = CommonContext.AERON_DIR_PROP_DEFAULT;
         private Aeron aeron;
+        private CredentialProvider credentialProvider;
         private boolean ownsAeronClient = true;
         private boolean isIngressExclusive = true;
 
@@ -471,6 +546,11 @@ public final class AeronCluster implements AutoCloseable
             if (null == lock)
             {
                 lock = new ReentrantLock();
+            }
+
+            if (null == credentialProvider)
+            {
+                credentialProvider = new CredentialProvider();
             }
         }
 
@@ -734,6 +814,28 @@ public final class AeronCluster implements AutoCloseable
         public boolean isIngressExclusive()
         {
             return isIngressExclusive;
+        }
+
+        /**
+         * Get the {@link CredentialProvider} to be used for authentication with the cluster.
+         *
+         * @return the {@link CredentialProvider} to be used for authentication with the cluster.
+         */
+        public CredentialProvider credentialProvider()
+        {
+            return credentialProvider;
+        }
+
+        /**
+         * Set the {@link CredentialProvider} to be used for authentication with the cluster.
+         *
+         * @param credentialProvider to be used for authentication with the cluster.
+         * @return this for fluent API.
+         */
+        public Context credentialProvider(final CredentialProvider credentialProvider)
+        {
+            this.credentialProvider = credentialProvider;
+            return this;
         }
 
         /**

@@ -29,6 +29,7 @@ public class EgressPoller implements ControlledFragmentHandler
     private final SessionEventDecoder sessionEventDecoder = new SessionEventDecoder();
     private final NewLeaderEventDecoder newLeaderEventDecoder = new NewLeaderEventDecoder();
     private final SessionHeaderDecoder sessionHeaderDecoder = new SessionHeaderDecoder();
+    private final ChallengeDecoder challengeDecoder = new ChallengeDecoder();
     private final ControlledFragmentAssembler fragmentAssembler = new ControlledFragmentAssembler(this);
     private final Subscription subscription;
     private long clusterSessionId = -1;
@@ -37,6 +38,7 @@ public class EgressPoller implements ControlledFragmentHandler
     private boolean pollComplete = false;
     private EventCode eventCode;
     private String detail = "";
+    private byte[] challengeData;
 
     public EgressPoller(final Subscription subscription, final int fragmentLimit)
     {
@@ -105,6 +107,16 @@ public class EgressPoller implements ControlledFragmentHandler
     }
 
     /**
+     * Get the challenge data in the last challenge.
+     *
+     * @return the challenge data in the last challenge or null if last message was not a challenge.
+     */
+    public byte[] challengeData()
+    {
+        return challengeData;
+    }
+
+    /**
      * Has the last polling action received a complete event?
      *
      * @return true of the last polling action received a complete event?
@@ -114,6 +126,16 @@ public class EgressPoller implements ControlledFragmentHandler
         return pollComplete;
     }
 
+    /**
+     * Was last message a challenge or not.
+     *
+     * @return true if last message was a challenge or false if not.
+     */
+    public boolean challenged()
+    {
+        return (ChallengeDecoder.TEMPLATE_ID == templateId);
+    }
+
     public int poll()
     {
         clusterSessionId = -1;
@@ -121,6 +143,7 @@ public class EgressPoller implements ControlledFragmentHandler
         templateId = -1;
         eventCode = null;
         detail = "";
+        challengeData = null;
         pollComplete = false;
 
         return subscription.controlledPoll(fragmentAssembler, fragmentLimit);
@@ -166,6 +189,20 @@ public class EgressPoller implements ControlledFragmentHandler
 
                 clusterSessionId = sessionHeaderDecoder.clusterSessionId();
                 correlationId = sessionHeaderDecoder.correlationId();
+                break;
+
+            case ChallengeDecoder.TEMPLATE_ID:
+                challengeDecoder.wrap(
+                    buffer,
+                    offset + MessageHeaderDecoder.ENCODED_LENGTH,
+                    messageHeaderDecoder.blockLength(),
+                    messageHeaderDecoder.version());
+
+                challengeData = new byte[challengeDecoder.challengeDataLength()];
+                challengeDecoder.getChallengeData(challengeData, 0, challengeDecoder.challengeDataLength());
+
+                clusterSessionId = challengeDecoder.clusterSessionId();
+                correlationId = challengeDecoder.correlationId();
                 break;
 
             default:

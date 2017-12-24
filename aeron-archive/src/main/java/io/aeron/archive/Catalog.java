@@ -42,15 +42,38 @@ import static org.agrona.BufferUtil.allocateDirectAligned;
  * The format is simple, allocating a fixed 1KB record for each record descriptor. This allows offset
  * based look up of a descriptor in the file.
  * <p>
+ * @see RecordingDescriptorHeaderDecoder
+ * @see RecordingDescriptorDecoder
  * Catalog file format:
  * <pre>
- *  # |---------------- 32b --------------|
- *  0 |desc-length 4b|------24b-unused----|
- *  1 |RecordingDescriptor (length < 1024)|
- *  2 |...continues...                    |
- * 128|------------- repeat --------------|
+ *   0                   1                   2                   3
+ *   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *  |                      Descriptor Length                        |
+ *  +---------------+-----------------------------------------------+
+ *  |     valid     |                  Reserved                     |
+ *  +---------------+-----------------------------------------------+
+ *  |                          Reserved                             |
+ *  +---------------------------------------------------------------+
+ *  |                          Reserved                             |
+ *  +---------------------------------------------------------------+
+ *  |                          Reserved                             |
+ *  +---------------------------------------------------------------+
+ *  |                          Reserved                             |
+ *  +---------------------------------------------------------------+
+ *  |                          Reserved                             |
+ *  +---------------------------------------------------------------+
+ *  |                          Reserved                             |
+ *  +---------------------------------------------------------------+
+ *  |                Recording Descriptor (< 1024)                  |
+ *  |                                                              ...
+ * ...                                                              |
+ *  +---------------------------------------------------------------+
+ *  |                          Repeats...                           |
+ *  |                                                              ...
+ * ...                                                              |
+ *  +---------------------------------------------------------------+
  * </pre>
- * <p>
  */
 class Catalog implements AutoCloseable
 {
@@ -69,10 +92,10 @@ class Catalog implements AutoCloseable
     static final int PAGE_SIZE = 4096;
     static final int NULL_RECORD_ID = -1;
 
+    static final int DESCRIPTOR_HEADER_LENGTH = RecordingDescriptorHeaderDecoder.BLOCK_LENGTH;
     static final int DEFAULT_RECORD_LENGTH = 1024;
     static final byte VALID = 1;
     static final byte INVALID = 0;
-    static final int DESCRIPTOR_HEADER_LENGTH = RecordingDescriptorHeaderDecoder.BLOCK_LENGTH;
 
     private final RecordingDescriptorHeaderDecoder descriptorHeaderDecoder = new RecordingDescriptorHeaderDecoder();
     private final RecordingDescriptorHeaderEncoder descriptorHeaderEncoder = new RecordingDescriptorHeaderEncoder();
@@ -85,7 +108,6 @@ class Catalog implements AutoCloseable
     private final UnsafeBuffer fieldAccessBuffer;
 
     private final int recordLength;
-
     private final int maxDescriptorStringsCombinedLength;
     private final int maxRecordingId;
     private final File archiveDir;
@@ -260,16 +282,6 @@ class Catalog implements AutoCloseable
         return descriptorLength(buffer) > 0 && isValidDescriptor(buffer);
     }
 
-    static int descriptorLength(final UnsafeBuffer descriptorBuffer)
-    {
-        return descriptorBuffer.getInt(RecordingDescriptorHeaderDecoder.lengthEncodingOffset(), LITTLE_ENDIAN);
-    }
-
-    static boolean isValidDescriptor(final UnsafeBuffer descriptorBuffer)
-    {
-        return descriptorBuffer.getByte(RecordingDescriptorHeaderDecoder.validEncodingOffset()) == VALID;
-    }
-
     boolean hasRecording(final long recordingId)
     {
         return recordingId >= 0 && recordingId < nextRecordingId &&
@@ -390,7 +402,17 @@ class Catalog implements AutoCloseable
         return summary;
     }
 
-    private int recordingDescriptorOffset(final long recordingId)
+    static int descriptorLength(final UnsafeBuffer descriptorBuffer)
+    {
+        return descriptorBuffer.getInt(RecordingDescriptorHeaderDecoder.lengthEncodingOffset(), LITTLE_ENDIAN);
+    }
+
+    static boolean isValidDescriptor(final UnsafeBuffer descriptorBuffer)
+    {
+        return descriptorBuffer.getByte(RecordingDescriptorHeaderDecoder.validEncodingOffset()) == VALID;
+    }
+
+    int recordingDescriptorOffset(final long recordingId)
     {
         return (int)(recordingId * recordLength) + recordLength;
     }

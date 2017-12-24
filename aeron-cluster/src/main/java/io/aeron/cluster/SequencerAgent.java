@@ -17,6 +17,7 @@ package io.aeron.cluster;
 
 import io.aeron.*;
 import io.aeron.cluster.codecs.*;
+import io.aeron.cluster.control.ClusterControl;
 import io.aeron.logbuffer.ControlledFragmentHandler;
 import org.agrona.CloseHelper;
 import org.agrona.DirectBuffer;
@@ -28,27 +29,13 @@ import java.util.ArrayList;
 import java.util.Iterator;
 
 import static io.aeron.cluster.ClusterSession.State.*;
-import static io.aeron.cluster.control.ClusterControl.Action.*;
+import static io.aeron.cluster.ConsensusModule.Configuration.SESSION_TIMEOUT_MSG;
 
 class SequencerAgent implements Agent
 {
-    enum State
-    {
-        INIT, ACTIVE, SUSPENDED
-    }
-
-    /**
-     * Message detail to be sent when max concurrent session limit is reached.
-     */
-    public static final String SESSION_LIMIT_MSG = "Concurrent session limit";
-
-    /**
-     * Message detail to be sent when a session timeout occurs.
-     */
-    public static final String SESSION_TIMEOUT_MSG = "Session inactive";
-
     private final long sessionTimeoutMs;
     private long nextSessionId = 1;
+    private long leadershipTermStartPosition = 0;
     private int servicesReadyCount = 0;
     private final AgentInvoker aeronClientInvoker;
     private final EpochClock epochClock;
@@ -59,15 +46,16 @@ class SequencerAgent implements Agent
     private final EgressPublisher egressPublisher;
     private final LogAppender logAppender;
     private final Counter messageIndex;
+    private final Counter moduleState;
     private final Counter controlToggle;
-    private final ClusterSessionSupplier clusterSessionSupplier;
+    private final ClusterSessionSupplier sessionSupplier;
     private final Long2ObjectHashMap<ClusterSession> sessionByIdMap = new Long2ObjectHashMap<>();
     private final ArrayList<ClusterSession> pendingSessions = new ArrayList<>();
     private final ArrayList<ClusterSession> rejectedSessions = new ArrayList<>();
     private final ConsensusModule.Context ctx;
-    private State state = State.INIT;
-
-    // TODO: last message correlation id per session counter
+    private final Authenticator authenticator;
+    private final SessionProxy sessionProxy;
+    private ConsensusModule.State state = ConsensusModule.State.INIT;
 
     SequencerAgent(
         final ConsensusModule.Context ctx,
@@ -84,13 +72,16 @@ class SequencerAgent implements Agent
         this.sessionTimeoutMs = ctx.sessionTimeoutNs() / 1000;
         this.egressPublisher = egressPublisher;
         this.messageIndex = ctx.messageIndex();
+        this.moduleState = ctx.moduleState();
         this.controlToggle = ctx.controlToggle();
         this.logAppender = logAppender;
-        this.clusterSessionSupplier = clusterSessionSupplier;
+        this.sessionSupplier = clusterSessionSupplier;
+        this.sessionProxy = new SessionProxy(egressPublisher);
 
         ingressAdapter = ingressAdapterSupplier.newIngressAdapter(this);
         timerService = timerServiceSupplier.newTimerService(this);
         consensusModuleAdapter = consensusModuleAdapterSupplier.newConsensusModuleAdapter(this);
+        authenticator = ctx.authenticatorSupplier().newAuthenticator(this.ctx);
         aeronClientInvoker = ctx.ownsAeronClient() ? ctx.aeron().conductorAgentInvoker() : null;
     }
 
@@ -120,10 +111,10 @@ class SequencerAgent implements Agent
             workCount += aeronClientInvoker.invoke();
         }
 
-        workCount += checkControlToggle();
+        workCount += checkControlToggle(nowMs);
         workCount += consensusModuleAdapter.poll();
 
-        if (State.ACTIVE == state)
+        if (ConsensusModule.State.ACTIVE == state)
         {
             workCount += processPendingSessions(pendingSessions, nowMs);
             workCount += timerService.poll(nowMs);
@@ -141,27 +132,76 @@ class SequencerAgent implements Agent
         return "sequencer";
     }
 
-    public void onServiceReady(final long serviceId)
+    public void onActionAck(
+        final long serviceId, final long logPosition, final long messageIndex, final ServiceAction action)
     {
-        if (servicesReadyCount >= ctx.serviceCount())
+        final long currentLogPosition = leadershipTermStartPosition + logAppender.position();
+        final long currentMessageIndex = this.messageIndex.getWeak();
+        if (logPosition != currentLogPosition || messageIndex != currentMessageIndex)
         {
-            throw new IllegalStateException("Service count exceeded: " + servicesReadyCount);
+            throw new IllegalStateException("Invalid log state:" +
+                " serviceId=" + serviceId +
+                ", logPosition=" + logPosition + " current log position is " + currentLogPosition +
+                ", messageIndex=" + messageIndex + " current message index is " + currentMessageIndex);
         }
 
-        ++servicesReadyCount;
-        state = State.ACTIVE;
+        switch (action)
+        {
+            case READY:
+                if (ConsensusModule.State.INIT != state)
+                {
+                    throw new IllegalStateException("Unexpected state: " + state);
+                }
+
+                if (servicesReadyCount >= ctx.serviceCount())
+                {
+                    throw new IllegalStateException("Service count exceeded: " + servicesReadyCount);
+                }
+
+                ++servicesReadyCount;
+                state(ConsensusModule.State.ACTIVE);
+                return;
+
+            case SNAPSHOT:
+                if (ConsensusModule.State.SNAPSHOT == state)
+                {
+                    state(ConsensusModule.State.ACTIVE);
+                    ClusterControl.ToggleState.reset(controlToggle);
+                }
+                return;
+
+            case SHUTDOWN:
+                if (ConsensusModule.State.SHUTDOWN == state)
+                {
+                    state(ConsensusModule.State.CLOSED);
+                    ctx.shutdownSignalBarrier().signal();
+                }
+                return;
+
+            case ABORT:
+                if (ConsensusModule.State.ABORT == state)
+                {
+                    state(ConsensusModule.State.CLOSED);
+                    ctx.shutdownSignalBarrier().signal();
+                }
+                return;
+        }
+
+        throw new IllegalStateException("Service action ack=" + action + " state=" + state);
     }
 
-    public void onSnapshotTaken(final long serviceId)
+    public void onSessionConnect(
+        final long correlationId,
+        final int responseStreamId,
+        final String responseChannel,
+        final byte[] credentialData)
     {
-    }
-
-    public void onSessionConnect(final long correlationId, final int responseStreamId, final String responseChannel)
-    {
+        final long nowMs = cachedEpochClock.time();
         final long sessionId = nextSessionId++;
-        final ClusterSession session = clusterSessionSupplier.newClusterSession(
-            sessionId, responseStreamId, responseChannel);
-        session.lastActivity(cachedEpochClock.time(), correlationId);
+        final ClusterSession session = sessionSupplier.newClusterSession(sessionId, responseStreamId, responseChannel);
+        session.lastActivity(nowMs, correlationId);
+
+        authenticator.onConnectRequest(sessionId, credentialData, nowMs);
 
         if (pendingSessions.size() + sessionByIdMap.size() < ctx.maxConcurrentSessions())
         {
@@ -220,6 +260,24 @@ class SequencerAgent implements Agent
         }
     }
 
+    public void onChallengeResponse(final long correlationId, final long clusterSessionId, final byte[] credentialData)
+    {
+        for (int lastIndex = pendingSessions.size() - 1, i = lastIndex; i >= 0; i--)
+        {
+            final ClusterSession session = pendingSessions.get(i);
+
+            if (session.id() == clusterSessionId && session.state() == CHALLENGED)
+            {
+                final long nowMs = cachedEpochClock.time();
+
+                session.lastActivity(nowMs, correlationId);
+
+                authenticator.onChallengeResponse(clusterSessionId, credentialData, nowMs);
+                break;
+            }
+        }
+    }
+
     public boolean onTimerEvent(final long correlationId, final long nowMs)
     {
         if (logAppender.appendTimerEvent(correlationId, nowMs))
@@ -242,44 +300,110 @@ class SequencerAgent implements Agent
         timerService.cancelTimer(correlationId);
     }
 
-    State state()
+    private void state(final ConsensusModule.State state)
     {
-        return state;
+        this.state = state;
+        moduleState.set(state.code());
     }
 
-    private int checkControlToggle()
+    private int checkControlToggle(final long nowMs)
     {
-        final long toggleCode = controlToggle.get();
+        int workCount = 0;
+        final ClusterControl.ToggleState toggleState = ClusterControl.ToggleState.get(controlToggle);
 
-        if (NEUTRAL.code() == toggleCode)
+        switch (toggleState)
         {
-            return 0;
+            case SUSPEND:
+                if (ConsensusModule.State.ACTIVE == state)
+                {
+                    state(ConsensusModule.State.SUSPENDED);
+                    ClusterControl.ToggleState.reset(controlToggle);
+                    workCount = 1;
+                }
+                break;
+
+            case RESUME:
+                if (ConsensusModule.State.SUSPENDED == state)
+                {
+                    state(ConsensusModule.State.ACTIVE);
+                    ClusterControl.ToggleState.reset(controlToggle);
+                    workCount = 1;
+                }
+                break;
+
+            case SNAPSHOT:
+                if (ConsensusModule.State.ACTIVE == state && appendSnapshot(nowMs))
+                {
+                    workCount = 1;
+                }
+                break;
+
+            case SHUTDOWN:
+                if (ConsensusModule.State.ACTIVE == state && appendShutdown(nowMs))
+                {
+                    workCount = 1;
+                }
+                break;
+
+            case ABORT:
+                if (ConsensusModule.State.ACTIVE == state && appendAbort(nowMs))
+                {
+                    workCount = 1;
+                }
+                break;
         }
 
-        if (SNAPSHOT.code() == toggleCode)
+        return workCount;
+    }
+
+    private boolean appendSnapshot(final long nowMs)
+    {
+        final long position = resultingServiceActionPosition();
+
+        if (logAppender.appendActionRequest(ServiceAction.SNAPSHOT, messageIndex.getWeak(), position, nowMs))
         {
-            if (logAppender.appendSnapshotRequest())
-            {
-                controlToggle.set(NEUTRAL.code());
-                return 1;
-            }
+            messageIndex.incrementOrdered();
+            state(ConsensusModule.State.SNAPSHOT);
+            return true;
         }
 
-        if (SUSPEND.code() == toggleCode)
+        return false;
+    }
+
+    private boolean appendShutdown(final long nowMs)
+    {
+        final long position = resultingServiceActionPosition();
+
+        if (logAppender.appendActionRequest(ServiceAction.SHUTDOWN, messageIndex.getWeak(), position, nowMs))
         {
-            state = State.SUSPENDED;
-            controlToggle.set(NEUTRAL.code());
-            return 1;
+            messageIndex.incrementOrdered();
+            state(ConsensusModule.State.SHUTDOWN);
+            return true;
         }
 
-        if (RESUME.code() == toggleCode)
+        return false;
+    }
+
+    private boolean appendAbort(final long nowMs)
+    {
+        final long position = resultingServiceActionPosition();
+
+        if (logAppender.appendActionRequest(ServiceAction.ABORT, messageIndex.getWeak(), position, nowMs))
         {
-            state = State.ACTIVE;
-            controlToggle.set(NEUTRAL.code());
-            return 1;
+            messageIndex.incrementOrdered();
+            state(ConsensusModule.State.ABORT);
+            return true;
         }
 
-        throw new IllegalStateException("Unknown toggle action code: " + toggleCode);
+        return false;
+    }
+
+    private long resultingServiceActionPosition()
+    {
+        return leadershipTermStartPosition +
+            logAppender.position() +
+            MessageHeaderEncoder.ENCODED_LENGTH +
+            ServiceActionRequestEncoder.BLOCK_LENGTH;
     }
 
     private int processPendingSessions(final ArrayList<ClusterSession> pendingSessions, final long nowMs)
@@ -290,18 +414,43 @@ class SequencerAgent implements Agent
         {
             final ClusterSession session = pendingSessions.get(i);
 
-            if (egressPublisher.sendEvent(session, EventCode.OK, ""))
+            if (session.state() == INIT || session.state() == CONNECTED)
+            {
+                if (session.responsePublication().isConnected())
+                {
+                    session.state(CONNECTED);
+                    sessionProxy.clusterSession(session);
+                    authenticator.onProcessConnectedSession(sessionProxy, nowMs);
+                }
+            }
+
+            if (session.state() == CHALLENGED)
+            {
+                if (session.responsePublication().isConnected())
+                {
+                    sessionProxy.clusterSession(session);
+                    authenticator.onProcessChallengedSession(sessionProxy, nowMs);
+                }
+            }
+
+            if (session.state() == AUTHENTICATED)
             {
                 ArrayListUtil.fastUnorderedRemove(pendingSessions, i, lastIndex);
                 lastIndex--;
 
                 session.timeOfLastActivityMs(nowMs);
-                session.state(CONNECTED);
                 sessionByIdMap.put(session.id(), session);
 
                 appendConnectedSession(session, nowMs);
 
                 workCount += 1;
+            }
+            else if (session.state() == REJECTED)
+            {
+                ArrayListUtil.fastUnorderedRemove(pendingSessions, i, lastIndex);
+                lastIndex--;
+
+                rejectedSessions.add(session);
             }
             else if (nowMs > (session.timeOfLastActivityMs() + sessionTimeoutMs))
             {
@@ -320,8 +469,16 @@ class SequencerAgent implements Agent
         for (int lastIndex = rejectedSessions.size() - 1, i = lastIndex; i >= 0; i--)
         {
             final ClusterSession session = rejectedSessions.get(i);
+            String detail = ConsensusModule.Configuration.SESSION_LIMIT_MSG;
+            EventCode eventCode = EventCode.ERROR;
 
-            if (egressPublisher.sendEvent(session, EventCode.ERROR, SESSION_LIMIT_MSG) ||
+            if (session.state() == REJECTED)
+            {
+                detail = ConsensusModule.Configuration.SESSION_REJECTED_MSG;
+                eventCode = EventCode.AUTHENTICATION_REJECTED;
+            }
+
+            if (egressPublisher.sendEvent(session, eventCode, detail) ||
                 nowMs > (session.timeOfLastActivityMs() + sessionTimeoutMs))
             {
                 ArrayListUtil.fastUnorderedRemove(rejectedSessions, i, lastIndex);
